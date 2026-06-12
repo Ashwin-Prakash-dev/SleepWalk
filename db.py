@@ -1,0 +1,164 @@
+"""Supabase data-access layer for the Enceladus knowledge graph.
+
+Wraps the Supabase Python client with typed helpers for the three tables
+(entities, nodes, edges) and the `match_nodes` similarity-search RPC.
+
+Credentials are read from the environment (see .env / .env.example):
+    SUPABASE_URL, SUPABASE_KEY
+"""
+from __future__ import annotations
+
+import os
+from typing import Any, Optional, Sequence
+
+from dotenv import load_dotenv
+from supabase import Client, create_client
+
+load_dotenv()
+
+# --- allowed values, mirrored from the CHECK constraints in schema.sql -------
+NODE_CATEGORIES: frozenset[str] = frozenset({"raw_input", "inference"})
+
+NODE_KINDS: frozenset[str] = frozenset({
+    "fact", "claim", "position", "event_announcement",
+    "prediction", "denial", "agreement", "contradiction", "derived",
+})
+
+EDGE_TYPES: frozenset[str] = frozenset({
+    "same_subject", "same_actor", "semantically_similar",
+    "derives_from", "contradicts",
+})
+
+# An embedding is a 1536-element list of floats (vector(1536) in Postgres).
+Embedding = Sequence[float]
+
+_client: Optional[Client] = None
+
+
+def client() -> Client:
+    """Return a lazily-created, process-wide Supabase client."""
+    global _client
+    if _client is None:
+        url = os.environ.get("SUPABASE_URL")
+        key = os.environ.get("SUPABASE_KEY")
+        if not url or not key:
+            raise RuntimeError(
+                "SUPABASE_URL and SUPABASE_KEY must be set in the environment "
+                "(copy .env.example to .env and fill them in)."
+            )
+        _client = create_client(url, key)
+    return _client
+
+
+def _first(resp: Any) -> dict[str, Any]:
+    """Return the first row of an insert/select response."""
+    if not resp.data:
+        raise RuntimeError("Supabase returned no rows for the operation.")
+    return resp.data[0]
+
+
+# --- entities ----------------------------------------------------------------
+def insert_entity(
+    name: str,
+    aliases: Optional[Sequence[str]] = None,
+    embedding: Optional[Embedding] = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"name": name}
+    if aliases is not None:
+        payload["aliases"] = list(aliases)
+    if embedding is not None:
+        payload["embedding"] = list(embedding)
+    return _first(client().table("entities").insert(payload).execute())
+
+
+def find_entity(name: str) -> Optional[dict[str, Any]]:
+    resp = client().table("entities").select("*").eq("name", name).limit(1).execute()
+    return resp.data[0] if resp.data else None
+
+
+def find_or_create_entity(
+    name: str,
+    aliases: Optional[Sequence[str]] = None,
+    embedding: Optional[Embedding] = None,
+) -> dict[str, Any]:
+    """Return the existing entity with this (unique) name, or create it."""
+    existing = find_entity(name)
+    if existing is not None:
+        return existing
+    return insert_entity(name, aliases, embedding)
+
+
+# --- nodes -------------------------------------------------------------------
+def insert_node(
+    node_category: str,
+    node_kind: str,
+    content: str,
+    *,
+    actor: Optional[str] = None,
+    entity_id: Optional[str] = None,
+    subject: Optional[str] = None,
+    confidence: float = 0.8,
+    source_url: Optional[str] = None,
+    event_date: Optional[str] = None,
+    expires_at: Optional[str] = None,
+    embedding: Optional[Embedding] = None,
+) -> dict[str, Any]:
+    if node_category not in NODE_CATEGORIES:
+        raise ValueError(f"node_category must be one of {sorted(NODE_CATEGORIES)}")
+    if node_kind not in NODE_KINDS:
+        raise ValueError(f"node_kind must be one of {sorted(NODE_KINDS)}")
+
+    payload: dict[str, Any] = {
+        "node_category": node_category,
+        "node_kind": node_kind,
+        "content": content,
+        "confidence": confidence,
+    }
+    optional = {
+        "actor": actor,
+        "entity_id": entity_id,
+        "subject": subject,
+        "source_url": source_url,
+        "event_date": event_date,
+        "expires_at": expires_at,
+    }
+    payload.update({k: v for k, v in optional.items() if v is not None})
+    if embedding is not None:
+        payload["embedding"] = list(embedding)
+    return _first(client().table("nodes").insert(payload).execute())
+
+
+# --- edges -------------------------------------------------------------------
+def insert_edge(
+    source_id: str,
+    target_id: str,
+    edge_type: str,
+    weight: float = 1.0,
+) -> dict[str, Any]:
+    if edge_type not in EDGE_TYPES:
+        raise ValueError(f"edge_type must be one of {sorted(EDGE_TYPES)}")
+    payload = {
+        "source_id": source_id,
+        "target_id": target_id,
+        "edge_type": edge_type,
+        "weight": weight,
+    }
+    return _first(client().table("edges").insert(payload).execute())
+
+
+# --- similarity search -------------------------------------------------------
+def match_nodes(
+    query_embedding: Embedding,
+    match_threshold: float = 0.75,
+    match_count: int = 15,
+) -> list[dict[str, Any]]:
+    """Call the `match_nodes` SQL function and return matching node rows."""
+    resp = client().rpc(
+        "match_nodes",
+        {
+            "query_embedding": list(query_embedding),
+            "match_threshold": match_threshold,
+            "match_count": match_count,
+        },
+    ).execute()
+    return resp.data or []
