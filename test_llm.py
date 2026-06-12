@@ -4,8 +4,9 @@ from llm_service import extract_node, run_inference
 # ── Test 1: extract a fact ──────────────────────────────────────
 print("TEST 1: fact extraction")
 result = extract_node(
-    "The FIFA World Cup 2026 will be hosted across the United States, Canada, and Mexico."
+    "The FIFA World Cup 2022 was held in Qatar."
 )
+assert result["node_kind"] == "fact"
 print(json.dumps(result, indent=2))
 
 assert result["node_kind"] == "fact", f"expected fact, got {result['node_kind']}"

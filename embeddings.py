@@ -1,41 +1,52 @@
-"""Embedding helper.
+"""Embedding helper (local, no API key required).
 
-Generates 1536-dimensional vectors with OpenAI's `text-embedding-3-small`,
-which matches the vector(1536) columns in schema.sql. Swap the model here if
-you change the schema's vector dimensionality.
+Uses a local sentence-transformers model and zero-pads the output to 1536
+dimensions so it drops into the existing vector(1536) schema unchanged.
 
-Reads OPENAI_API_KEY from the environment (see .env).
+Why padding: the `embedding` columns, the ivfflat index, and the match_nodes()
+function are all declared vector(1536) (originally sized for OpenAI
+text-embedding-3-small). all-MiniLM-L6-v2 produces 384-dim vectors; appending
+zeros to reach 1536 is lossless for cosine similarity — zeros don't change dot
+products or L2 norms — so no schema migration is required.
+
+Caveat: every vector stored in the DB must come from the same model for
+similarity to be meaningful. If you switch models (or back to OpenAI), re-embed
+all existing rows.
 """
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Optional, Sequence
 
-from dotenv import load_dotenv
-from openai import OpenAI
+from sentence_transformers import SentenceTransformer
 
-load_dotenv()
+MODEL_NAME = "all-MiniLM-L6-v2"  # 384-dim, fast, ~80MB download on first use
+NATIVE_DIM = 384
+DIMENSIONS = 1536  # padded width — matches schema.sql vector(1536)
 
-MODEL = "text-embedding-3-small"  # 1536 dimensions
-DIMENSIONS = 1536
-
-_oai: OpenAI | None = None
+_model: Optional[SentenceTransformer] = None
 
 
-def _openai() -> OpenAI:
-    global _oai
-    if _oai is None:
-        _oai = OpenAI()  # picks up OPENAI_API_KEY from the environment
-    return _oai
+def _get_model() -> SentenceTransformer:
+    global _model
+    if _model is None:
+        _model = SentenceTransformer(MODEL_NAME)
+    return _model
+
+
+def _pad(vec: list[float]) -> list[float]:
+    """Right-pad a native embedding with zeros to DIMENSIONS (lossless for cosine)."""
+    if len(vec) >= DIMENSIONS:
+        return vec[:DIMENSIONS]
+    return vec + [0.0] * (DIMENSIONS - len(vec))
 
 
 def embed(text: str) -> list[float]:
-    """Return the embedding for a single string."""
-    resp = _openai().embeddings.create(model=MODEL, input=text)
-    return resp.data[0].embedding
+    """Return a 1536-dim embedding for a single string."""
+    vec = _get_model().encode(text, normalize_embeddings=True).tolist()
+    return _pad(vec)
 
 
 def embed_batch(texts: Sequence[str]) -> list[list[float]]:
-    """Return embeddings for many strings in one request."""
-    resp = _openai().embeddings.create(model=MODEL, input=list(texts))
-    # OpenAI preserves input order, but sort on index to be safe.
-    return [item.embedding for item in sorted(resp.data, key=lambda d: d.index)]
+    """Return 1536-dim embeddings for many strings in one batch."""
+    vecs = _get_model().encode(list(texts), normalize_embeddings=True)
+    return [_pad(v.tolist()) for v in vecs]

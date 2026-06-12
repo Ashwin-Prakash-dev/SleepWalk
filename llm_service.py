@@ -16,24 +16,20 @@ from __future__ import annotations
 
 import json
 from typing import Any, Optional
-
-from anthropic import Anthropic
+from groq import Groq
 from dotenv import load_dotenv
 
 load_dotenv()
 
-MODEL = "claude-sonnet-4-6"
+...
+MODEL = "llama-3.3-70b-versatile"
+_client: Optional[Groq] = None
 
-_client: Optional[Anthropic] = None
-
-
-def client() -> Anthropic:
-    """Lazily create a process-wide Anthropic client (reads ANTHROPIC_API_KEY)."""
+def client() -> Groq:
     global _client
     if _client is None:
-        _client = Anthropic()
+        _client = Groq()
     return _client
-
 
 # --- prompts (verbatim) ------------------------------------------------------
 EXTRACT_SYSTEM_PROMPT = (
@@ -95,25 +91,24 @@ def _strip_code_fences(text: str) -> str:
     return text.strip()
 
 
-def _complete_json(
-    system: str,
-    prompt: str,
-    *,
-    max_tokens: int,
-) -> Any:
+def _complete_json(system: str, prompt: str, *, max_tokens: int) -> Any:
     last_error: Optional[Exception] = None
     for _ in range(2):
-        response = client().messages.create(
+        response = client().chat.completions.create(
             model=MODEL,
             max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
         )
         try:
-            return json.loads(_strip_code_fences(_message_text(response)))
+            text = response.choices[0].message.content.strip()
+            return json.loads(_strip_code_fences(text))
         except json.JSONDecodeError as exc:
             last_error = exc
-    raise ValueError(f"Claude did not return valid JSON after one retry: {last_error}")
+    raise ValueError(f"Did not return valid JSON after one retry: {last_error}")
 
 def _format_similar_nodes(nodes: list[dict]) -> str:
     """Render stored nodes as an indexed list the model can reference by index."""
