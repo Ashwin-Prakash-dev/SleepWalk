@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 
 import db
 from embeddings import embed
-from llm_service import extract_node, run_inference
+from llm_service import extract_node, resolve_entity_coreference, run_inference
 
 load_dotenv()
 
@@ -34,12 +34,17 @@ SIMILARITY_THRESHOLD = 0.45
 STRUCTURAL_EDGE_LIMIT = 10
 INFERENCE_CONTEXT_SIZE = 15
 
-# Entity resolution: cosine threshold for matching a new actor surface form to an
-# existing entity via embeddings (local all-MiniLM-L6-v2, padded to 1536). Set
-# high on purpose — a false merge of two distinct actors (e.g. "Iran"/"Iraq")
-# corrupts coverage/independence signals more than leftover fragmentation does, so
-# bias toward not merging. This is the primary knob to calibrate against your data.
+# ENTITY_MATCH_THRESHOLD kept for backwards compatibility (imported by test_entities.py).
+# The main resolution path no longer uses it directly — see ENTITY_CANDIDATE_THRESHOLD.
 ENTITY_MATCH_THRESHOLD = 0.85
+
+# Two-stage entity resolution knobs:
+#   ENTITY_CANDIDATE_THRESHOLD — wide-net cosine cutoff for candidate generation.
+#     Lower than ENTITY_MATCH_THRESHOLD so surface forms like "Russian forces"
+#     are surfaced as candidates for "Russia" (they sit ~0.55-0.70 with MiniLM).
+#   ENTITY_CANDIDATE_K — max candidates handed to the LLM coreference step.
+ENTITY_CANDIDATE_THRESHOLD = 0.50
+ENTITY_CANDIDATE_K = 5
 
 # Topic resolution: slightly lower than entity threshold because topic surface
 # forms cluster more broadly ("nuclear talks" / "nuclear negotiations" should
@@ -62,20 +67,19 @@ def _pg_quote(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _resolve_entity(actor: str) -> str:
+def _resolve_entity(actor: str, context: str = "") -> str:
     """Return the entity id for `actor`, creating the entity if needed.
 
-    Resolution order:
-      1. Exact (case-insensitive) name match OR alias-array containment — cheap.
-      2. Embedding similarity against existing entities above
-         ENTITY_MATCH_THRESHOLD. On a hit, `actor` is recorded as an alias on the
-         matched entity so future lookups hit step 1.
-      3. Otherwise create a new entity, storing its name embedding so it can be
-         matched in step 2 next time.
+    Two-stage pipeline:
+      1. Exact (case-insensitive) name or alias match — no embedding, no LLM.
+      2a. Embedding KNN (ENTITY_CANDIDATE_THRESHOLD, top ENTITY_CANDIDATE_K) narrows
+          the entity table to a small candidate set.
+      2b. LLM coreference decision over that set: same real-world referent → merge
+          and record alias; distinct entity → fall through.
+      3. Create a new entity with its name embedding for future candidate generation.
 
-    Steps 2-3 collapse sibling surface forms of one real-world actor onto a single
-    entity; the coverage and corroboration-independence signals downstream depend
-    on that not fragmenting.
+    `context` is the source sentence the actor was extracted from; it's passed to
+    the LLM in step 2b to distinguish coreference from mere relatedness.
     """
     safe = _pg_quote(actor)
     res = (
@@ -89,17 +93,19 @@ def _resolve_entity(actor: str) -> str:
     if res.data:
         return res.data[0]["id"]
 
-    # 2. Embedding-based resolution against entities seen before.
     actor_embedding = embed(actor)
-    matches = db.match_entities(
-        actor_embedding, match_threshold=ENTITY_MATCH_THRESHOLD, match_count=1
+    candidates = db.match_entities(
+        actor_embedding,
+        match_threshold=ENTITY_CANDIDATE_THRESHOLD,
+        match_count=ENTITY_CANDIDATE_K,
     )
-    if matches:
-        entity_id = matches[0]["id"]
-        db.add_entity_alias(entity_id, actor)
-        return entity_id
+    if candidates:
+        idx = resolve_entity_coreference(actor, context, candidates)
+        if idx is not None and 0 <= idx < len(candidates):
+            entity_id = candidates[idx]["id"]
+            db.add_entity_alias(entity_id, actor)
+            return entity_id
 
-    # 3. New entity — store its embedding so future surface forms can resolve to it.
     return db.insert_entity(name=actor, aliases=[actor], embedding=actor_embedding)["id"]
 
 
@@ -175,13 +181,15 @@ def _link_entities(
     node_id: str,
     primary_entity_id: Optional[str],
     extracted_entities: Optional[list[dict]],
+    context: str = "",
 ) -> None:
     """Populate node_entities for a node (additive; nodes.entity_id is untouched).
 
     Links the primary actor (role 'actor', via the already-resolved
     `primary_entity_id`) plus every entity from the extraction's `entities` list,
-    each resolved through the shared `_resolve_entity` alias logic. Deduped per
-    entity, with the primary actor winning so it always keeps role 'actor'.
+    each resolved through the shared `_resolve_entity` coreference logic. Deduped
+    per entity, with the primary actor winning so it always keeps role 'actor'.
+    `context` is the source sentence forwarded to the coreference LLM.
     """
     roles: dict[str, str] = {}
     if primary_entity_id:
@@ -190,7 +198,7 @@ def _link_entities(
         name = (item or {}).get("name")
         if not name:
             continue
-        entity_id = _resolve_entity(name)
+        entity_id = _resolve_entity(name, context)
         roles.setdefault(entity_id, (item or {}).get("role") or "mentioned")
     for entity_id, role in roles.items():
         db.insert_node_entity(node_id, entity_id, role)
@@ -210,13 +218,19 @@ def ingest_text(text: str, source_url: str = None) -> str:
     # Step 2 — embed the core content.
     embedding = embed(node["content"])
 
-    # Step 3 — entity resolution.
-    entity_id = _resolve_entity(actor) if actor else None
+    # Step 3 — entity resolution (two-stage: KNN candidates → LLM coreference).
+    entity_id = _resolve_entity(actor, text) if actor else None
 
     # Step 4 — insert the raw-input node.
+    # Normalise node_kind: the LLM occasionally invents values outside the CHECK
+    # constraint (e.g. "warning", "report"). Fall back to "claim" rather than crash.
+    node_kind = node.get("node_kind")
+    if node_kind not in db.NODE_KINDS:
+        node_kind = "claim"
+
     new_row = db.insert_node(
         node_category="raw_input",
-        node_kind=node["node_kind"],
+        node_kind=node_kind,
         content=node["content"],
         actor=actor,
         entity_id=entity_id,
@@ -230,7 +244,7 @@ def ingest_text(text: str, source_url: str = None) -> str:
 
     # Step 4b — multi-entity links (additive). The primary actor (entity_id) and
     # every extracted entity land in node_entities; nodes.entity_id is unchanged.
-    _link_entities(new_id, entity_id, node.get("entities"))
+    _link_entities(new_id, entity_id, node.get("entities"), text)
 
     # Step 4c — domain links. Fall back to [subject] if the LLM didn't return domains.
     domains = node.get("domains") or ([subject] if subject else [])

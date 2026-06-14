@@ -115,6 +115,64 @@ def _complete_json(system: str, prompt: str, *, max_tokens: int) -> Any:
             last_error = exc
     raise ValueError(f"Did not return valid JSON after one retry: {last_error}")
 
+COREFERENCE_SYSTEM_PROMPT = (
+    "You are an entity coreference resolver. "
+    "Coreference means the same real-world referent: 'Russian forces' and 'Russia' are the "
+    "same state actor; 'Russia' and 'Ukraine' are distinct states and must never be merged "
+    "even when they appear together. "
+    "Respond with valid JSON only: {\"match\": <integer> | null}"
+)
+
+COREFERENCE_USER_PROMPT = """Mention to resolve: "{mention}"
+Source sentence: "{context}"
+
+Candidate entities (0-indexed):
+{candidates}
+
+Does the mention refer to the same real-world entity as one of the candidates?
+- Same referent → return the 0-based index. (e.g. "Russian forces" → "Russia", "US" → "United States", "Tehran" → "Iran", "Iran's foreign minister" → "Iran")
+- Distinct entity, or not enough information → return null. (e.g. "Russia" when candidates include only "Ukraine")
+
+Return JSON only: {{"match": <integer> | null}}"""
+
+
+def _format_candidates(candidates: list[dict]) -> str:
+    lines = []
+    for i, c in enumerate(candidates):
+        aliases = [a for a in (c.get("aliases") or []) if a != c["name"]]
+        alias_str = f" (also: {', '.join(aliases[:4])})" if aliases else ""
+        lines.append(f"[{i}] {c['name']}{alias_str}")
+    return "\n".join(lines)
+
+
+def resolve_entity_coreference(
+    mention: str,
+    context: str,
+    candidates: list[dict],
+) -> Optional[int]:
+    """Return 0-based index of the candidate the mention coreferents with, or None.
+
+    candidates: list of dicts with 'name', 'aliases', 'id' (match_entities output).
+    Context is capped at 300 chars; max_tokens=50 keeps the call cheap.
+    """
+    if not candidates:
+        return None
+    prompt = COREFERENCE_USER_PROMPT.format(
+        mention=mention,
+        context=context[:300],
+        candidates=_format_candidates(candidates),
+    )
+    try:
+        result = _complete_json(COREFERENCE_SYSTEM_PROMPT, prompt, max_tokens=50)
+        if isinstance(result, dict):
+            match = result.get("match")
+            if isinstance(match, int):
+                return match
+    except ValueError:
+        pass
+    return None
+
+
 def _format_similar_nodes(nodes: list[dict]) -> str:
     """Render stored nodes as an indexed list the model can reference by index."""
     if not nodes:
