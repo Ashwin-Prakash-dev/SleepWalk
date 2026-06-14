@@ -146,6 +146,24 @@ def insert_edge(
     return _first(client().table("edges").insert(payload).execute())
 
 
+# --- node <-> entity links ---------------------------------------------------
+def insert_node_entity(
+    node_id: str,
+    entity_id: str,
+    role: Optional[str] = None,
+) -> dict[str, Any]:
+    """Link a node to an entity with a role (actor/target/mentioned).
+
+    Additive to nodes.entity_id — records every participating entity in the
+    node_entities join table. Upserts on the (node_id, entity_id) primary key so
+    re-linking the same pair is idempotent.
+    """
+    payload: dict[str, Any] = {"node_id": node_id, "entity_id": entity_id}
+    if role is not None:
+        payload["role"] = role
+    return _first(client().table("node_entities").upsert(payload).execute())
+
+
 # --- similarity search -------------------------------------------------------
 def match_nodes(
     query_embedding: Embedding,
@@ -162,3 +180,37 @@ def match_nodes(
         },
     ).execute()
     return resp.data or []
+
+
+# --- streams (read-time entity-pair channel) ---------------------------------
+def stream_between(
+    a: str,
+    b: str,
+    max_count: int = 100,
+) -> list[dict[str, Any]]:
+    """Call the `stream_between` SQL function: nodes involving BOTH entities.
+
+    Read-time prototype — derived from node_entities on every call; there is no
+    materialized streams table.
+    """
+    resp = client().rpc(
+        "stream_between",
+        {"a": a, "b": b, "max_count": max_count},
+    ).execute()
+    return resp.data or []
+
+
+def stream_between_names(
+    name_a: str,
+    name_b: str,
+    max_count: int = 100,
+) -> list[dict[str, Any]]:
+    """Convenience overload: resolve two entity names to ids, then stream_between.
+
+    Returns an empty list if either name does not match an existing entity.
+    """
+    a = find_entity(name_a)
+    b = find_entity(name_b)
+    if a is None or b is None:
+        return []
+    return stream_between(a["id"], b["id"], max_count)

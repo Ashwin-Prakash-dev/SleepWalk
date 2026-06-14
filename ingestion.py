@@ -99,6 +99,31 @@ def _edge_exists(a: str, b: str, edge_type: str) -> bool:
     return bool(res.data)
 
 
+def _link_entities(
+    node_id: str,
+    primary_entity_id: Optional[str],
+    extracted_entities: Optional[list[dict]],
+) -> None:
+    """Populate node_entities for a node (additive; nodes.entity_id is untouched).
+
+    Links the primary actor (role 'actor', via the already-resolved
+    `primary_entity_id`) plus every entity from the extraction's `entities` list,
+    each resolved through the shared `_resolve_entity` alias logic. Deduped per
+    entity, with the primary actor winning so it always keeps role 'actor'.
+    """
+    roles: dict[str, str] = {}
+    if primary_entity_id:
+        roles[primary_entity_id] = "actor"
+    for item in extracted_entities or []:
+        name = (item or {}).get("name")
+        if not name:
+            continue
+        entity_id = _resolve_entity(name)
+        roles.setdefault(entity_id, (item or {}).get("role") or "mentioned")
+    for entity_id, role in roles.items():
+        db.insert_node_entity(node_id, entity_id, role)
+
+
 # --- pipeline ----------------------------------------------------------------
 def ingest_text(text: str, source_url: str = None) -> str:
     """Run the full ingestion pipeline on one piece of text.
@@ -130,6 +155,10 @@ def ingest_text(text: str, source_url: str = None) -> str:
         embedding=embedding,
     )
     new_id = new_row["id"]
+
+    # Step 4b — multi-entity links (additive). The primary actor (entity_id) and
+    # every extracted entity land in node_entities; nodes.entity_id is unchanged.
+    _link_entities(new_id, entity_id, node.get("entities"))
 
     # Step 5 — structural edges (same actor / same subject).
     _structural_edges(new_id, "actor", actor, "same_actor")

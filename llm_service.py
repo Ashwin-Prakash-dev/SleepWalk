@@ -3,7 +3,10 @@
 Two entry points, both backed by Claude via the Anthropic Python SDK:
 
 - extract_node(text, source_url=None) -> dict
-    Pull one structured node out of a piece of raw text.
+    Pull one structured node out of a piece of raw text. The result keeps the
+    single primary `actor` field and additionally carries an `entities` list of
+    {"name", "role"} objects (role in actor|target|mentioned) for every entity
+    named in the text — additive, so existing consumers of `actor` are unaffected.
 
 - run_inference(new_node, similar_nodes) -> list[dict]
     Compare a new node against semantically similar stored nodes and surface
@@ -45,6 +48,7 @@ EXTRACT_USER_PROMPT = """Extract structured information from the following text 
 - confidence: float between 0.0 and 1.0 based on source credibility and certainty of language
 - expires_at: ISO date string or null (only for event_announcements with a clear future date)
 - denies_claim: string or null (if node_kind is denial, briefly describe what claim is being denied)
+- entities: array of objects, one per distinct entity (country, organization, or person) named in the text, each {"name": string, "role": one of exactly "actor", "target", "mentioned"}. The primary actor above MUST also appear here with role "actor"; use "target" for an entity the action is directed at, and "mentioned" for any other entity referenced.
 
 Text to extract from:
 {text}"""
@@ -128,8 +132,17 @@ def _format_similar_nodes(nodes: list[dict]) -> str:
 def extract_node(text: str, source_url: str = None) -> dict:
     """Extract one structured node from raw text.
 
-    Returns the parsed JSON object. When `source_url` is provided it is attached
-    as `source_url` on the returned dict so the caller can persist provenance.
+    Returns the parsed JSON object, e.g.::
+
+        {"actor": "United States", "subject": "Iran sanctions",
+         "node_kind": "claim", "content": "...", "confidence": 0.9,
+         "expires_at": null, "denies_claim": null,
+         "entities": [{"name": "United States", "role": "actor"},
+                      {"name": "Iran", "role": "target"}]}
+
+    The top-level `actor` (primary actor) is preserved; `entities` is additive.
+    When `source_url` is provided it is attached as `source_url` on the returned
+    dict so the caller can persist provenance.
     """
     prompt = EXTRACT_USER_PROMPT.format(text=text)
     node = _complete_json(
