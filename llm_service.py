@@ -42,7 +42,8 @@ EXTRACT_SYSTEM_PROMPT = (
 
 EXTRACT_USER_PROMPT = """Extract structured information from the following text and return a JSON object with exactly these fields:
 - actor: string or null (the entity making the statement or primarily involved)
-- subject: string (2-4 word topic tag, e.g. 'missile capabilities', 'World Cup hosting')
+- subject: string (2-4 word primary topic tag — the single most salient theme, e.g. 'missile capabilities', 'oil exports')
+- domains: array of strings, each 2-4 words naming a distinct thematic dimension of the event (always include the subject's domain; add others only if clearly present — e.g. ["energy", "military conflict"] for an event where drone strikes cause oil export cuts). Minimum 1 element, typically 1-3.
 - node_kind: one of exactly: fact, claim, position, event_announcement, prediction, denial, agreement
 - content: string (one sentence summary of the core information)
 - confidence: float between 0.0 and 1.0 based on source credibility and certainty of language
@@ -144,7 +145,7 @@ def extract_node(text: str, source_url: str = None) -> dict:
     When `source_url` is provided it is attached as `source_url` on the returned
     dict so the caller can persist provenance.
     """
-    prompt = EXTRACT_USER_PROMPT.format(text=text)
+    prompt = EXTRACT_USER_PROMPT.replace("{text}", text)
     node = _complete_json(
         EXTRACT_SYSTEM_PROMPT,
         prompt,

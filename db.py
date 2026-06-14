@@ -88,6 +88,44 @@ def find_or_create_entity(
     return insert_entity(name, aliases, embedding)
 
 
+def add_entity_alias(entity_id: str, alias: str) -> dict[str, Any]:
+    """Append `alias` to an entity's aliases array (no-op if already present).
+
+    Used by embedding-based resolution to record a newly-seen surface form on the
+    entity it resolved to, so future lookups hit the cheap exact/alias path.
+    """
+    row = _first(
+        client().table("entities").select("id,aliases").eq("id", entity_id).execute()
+    )
+    aliases = list(row.get("aliases") or [])
+    if alias in aliases:
+        return row
+    aliases.append(alias)
+    return _first(
+        client().table("entities").update({"aliases": aliases}).eq("id", entity_id).execute()
+    )
+
+
+def match_entities(
+    query_embedding: Embedding,
+    match_threshold: float = 0.85,
+    match_count: int = 5,
+) -> list[dict[str, Any]]:
+    """Call the `match_entities` SQL function: entities near a query embedding.
+
+    Mirrors `match_nodes`. Returns rows ordered by descending similarity.
+    """
+    resp = client().rpc(
+        "match_entities",
+        {
+            "query_embedding": list(query_embedding),
+            "match_threshold": match_threshold,
+            "match_count": match_count,
+        },
+    ).execute()
+    return resp.data or []
+
+
 # --- nodes -------------------------------------------------------------------
 def insert_node(
     node_category: str,
@@ -162,6 +200,115 @@ def insert_node_entity(
     if role is not None:
         payload["role"] = role
     return _first(client().table("node_entities").upsert(payload).execute())
+
+
+# --- topics ------------------------------------------------------------------
+def insert_topic(
+    name: str,
+    aliases: Optional[Sequence[str]] = None,
+    embedding: Optional[Embedding] = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"name": name}
+    if aliases is not None:
+        payload["aliases"] = list(aliases)
+    if embedding is not None:
+        payload["embedding"] = list(embedding)
+    return _first(client().table("topics").insert(payload).execute())
+
+
+def find_topic(name: str) -> Optional[dict[str, Any]]:
+    resp = client().table("topics").select("*").eq("name", name).limit(1).execute()
+    return resp.data[0] if resp.data else None
+
+
+def add_topic_alias(topic_id: str, alias: str) -> dict[str, Any]:
+    row = _first(
+        client().table("topics").select("id,aliases").eq("id", topic_id).execute()
+    )
+    aliases = list(row.get("aliases") or [])
+    if alias in aliases:
+        return row
+    aliases.append(alias)
+    return _first(
+        client().table("topics").update({"aliases": aliases}).eq("id", topic_id).execute()
+    )
+
+
+def match_topics(
+    query_embedding: Embedding,
+    match_threshold: float = 0.80,
+    match_count: int = 5,
+) -> list[dict[str, Any]]:
+    resp = client().rpc(
+        "match_topics",
+        {
+            "query_embedding": list(query_embedding),
+            "match_threshold": match_threshold,
+            "match_count": match_count,
+        },
+    ).execute()
+    return resp.data or []
+
+
+def insert_node_topic(node_id: str, topic_id: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {"node_id": node_id, "topic_id": topic_id}
+    return _first(client().table("node_topics").upsert(payload).execute())
+
+
+def nodes_by_entity(entity_id: str, exclude_id: str, limit: int = 10) -> list[dict[str, Any]]:
+    """Recent raw_input nodes involving entity_id, for inference pool expansion."""
+    id_rows = (
+        client()
+        .table("node_entities")
+        .select("node_id")
+        .eq("entity_id", entity_id)
+        .neq("node_id", exclude_id)
+        .limit(50)
+        .execute()
+        .data or []
+    )
+    if not id_rows:
+        return []
+    ids = [r["node_id"] for r in id_rows]
+    return (
+        client()
+        .table("nodes")
+        .select("id,node_kind,actor,subject,confidence,content")
+        .in_("id", ids)
+        .eq("node_category", "raw_input")
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+        .data or []
+    )
+
+
+def nodes_by_topic(topic_id: str, exclude_id: str, limit: int = 10) -> list[dict[str, Any]]:
+    """Recent raw_input nodes in a topic domain, for inference pool expansion."""
+    id_rows = (
+        client()
+        .table("node_topics")
+        .select("node_id")
+        .eq("topic_id", topic_id)
+        .neq("node_id", exclude_id)
+        .limit(50)
+        .execute()
+        .data or []
+    )
+    if not id_rows:
+        return []
+    ids = [r["node_id"] for r in id_rows]
+    return (
+        client()
+        .table("nodes")
+        .select("id,node_kind,actor,subject,confidence,content")
+        .in_("id", ids)
+        .eq("node_category", "raw_input")
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+        .data or []
+    )
 
 
 # --- similarity search -------------------------------------------------------

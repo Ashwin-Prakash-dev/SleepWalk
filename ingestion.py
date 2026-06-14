@@ -34,6 +34,20 @@ SIMILARITY_THRESHOLD = 0.45
 STRUCTURAL_EDGE_LIMIT = 10
 INFERENCE_CONTEXT_SIZE = 15
 
+# Entity resolution: cosine threshold for matching a new actor surface form to an
+# existing entity via embeddings (local all-MiniLM-L6-v2, padded to 1536). Set
+# high on purpose — a false merge of two distinct actors (e.g. "Iran"/"Iraq")
+# corrupts coverage/independence signals more than leftover fragmentation does, so
+# bias toward not merging. This is the primary knob to calibrate against your data.
+ENTITY_MATCH_THRESHOLD = 0.85
+
+# Topic resolution: slightly lower than entity threshold because topic surface
+# forms cluster more broadly ("nuclear talks" / "nuclear negotiations" should
+# merge; "energy" / "military conflict" should not).
+TOPIC_MATCH_THRESHOLD = 0.82
+
+_CHANNEL_LIMIT = 10  # max nodes pulled per entity/domain channel into inference pool
+
 
 # --- small helpers -----------------------------------------------------------
 def _to_float(value: Any, default: float) -> float:
@@ -51,20 +65,42 @@ def _pg_quote(value: str) -> str:
 def _resolve_entity(actor: str) -> str:
     """Return the entity id for `actor`, creating the entity if needed.
 
-    Matches `entities` where name ILIKE actor OR aliases @> ARRAY[actor].
+    Resolution order:
+      1. Exact (case-insensitive) name match OR alias-array containment — cheap.
+      2. Embedding similarity against existing entities above
+         ENTITY_MATCH_THRESHOLD. On a hit, `actor` is recorded as an alias on the
+         matched entity so future lookups hit step 1.
+      3. Otherwise create a new entity, storing its name embedding so it can be
+         matched in step 2 next time.
+
+    Steps 2-3 collapse sibling surface forms of one real-world actor onto a single
+    entity; the coverage and corroboration-independence signals downstream depend
+    on that not fragmenting.
     """
     safe = _pg_quote(actor)
     res = (
         db.client()
         .table("entities")
-        .select("*")
+        .select("id")
         .or_(f'name.ilike."{safe}",aliases.cs.{{"{safe}"}}')
         .limit(1)
         .execute()
     )
     if res.data:
         return res.data[0]["id"]
-    return db.insert_entity(name=actor, aliases=[actor])["id"]
+
+    # 2. Embedding-based resolution against entities seen before.
+    actor_embedding = embed(actor)
+    matches = db.match_entities(
+        actor_embedding, match_threshold=ENTITY_MATCH_THRESHOLD, match_count=1
+    )
+    if matches:
+        entity_id = matches[0]["id"]
+        db.add_entity_alias(entity_id, actor)
+        return entity_id
+
+    # 3. New entity — store its embedding so future surface forms can resolve to it.
+    return db.insert_entity(name=actor, aliases=[actor], embedding=actor_embedding)["id"]
 
 
 def _structural_edges(new_id: str, column: str, value: Optional[str], edge_type: str) -> None:
@@ -97,6 +133,42 @@ def _edge_exists(a: str, b: str, edge_type: str) -> bool:
         .execute()
     )
     return bool(res.data)
+
+
+def _resolve_topic(name: str) -> str:
+    """Return the topic id for `name`, creating the topic if needed.
+
+    Mirrors _resolve_entity: exact/alias match → embedding similarity → create.
+    """
+    safe = _pg_quote(name)
+    res = (
+        db.client()
+        .table("topics")
+        .select("id")
+        .or_(f'name.ilike."{safe}",aliases.cs.{{"{safe}"}}')
+        .limit(1)
+        .execute()
+    )
+    if res.data:
+        return res.data[0]["id"]
+
+    topic_embedding = embed(name)
+    matches = db.match_topics(topic_embedding, match_threshold=TOPIC_MATCH_THRESHOLD, match_count=1)
+    if matches:
+        topic_id = matches[0]["id"]
+        db.add_topic_alias(topic_id, name)
+        return topic_id
+
+    return db.insert_topic(name=name, aliases=[name], embedding=topic_embedding)["id"]
+
+
+def _link_topics(node_id: str, domains: Optional[list]) -> None:
+    """Resolve each domain string to a topic row and link it to the node."""
+    for name in domains or []:
+        if not name:
+            continue
+        topic_id = _resolve_topic(name)
+        db.insert_node_topic(node_id, topic_id)
 
 
 def _link_entities(
@@ -160,6 +232,10 @@ def ingest_text(text: str, source_url: str = None) -> str:
     # every extracted entity land in node_entities; nodes.entity_id is unchanged.
     _link_entities(new_id, entity_id, node.get("entities"))
 
+    # Step 4c — domain links. Fall back to [subject] if the LLM didn't return domains.
+    domains = node.get("domains") or ([subject] if subject else [])
+    _link_topics(new_id, domains)
+
     # Step 5 — structural edges (same actor / same subject).
     _structural_edges(new_id, "actor", actor, "same_actor")
     _structural_edges(new_id, "subject", subject, "same_subject")
@@ -175,10 +251,50 @@ def ingest_text(text: str, source_url: str = None) -> str:
         if sim > SIMILARITY_THRESHOLD and not _edge_exists(new_id, m["id"], "semantically_similar"):
             db.insert_edge(new_id, m["id"], "semantically_similar", weight=sim)
 
-    # Step 7 — inference.
-    _run_inference_step(node, new_id, actor, subject, similar[:INFERENCE_CONTEXT_SIZE])
+    # Step 7 — inference with expanded pool (semantic + entity neighbors + domain neighbors).
+    context = _expand_inference_pool(new_id, similar)
+    _run_inference_step(node, new_id, actor, subject, context)
 
     return new_id
+
+
+def _expand_inference_pool(new_id: str, semantic: list[dict]) -> list[dict]:
+    """Merge semantic-similar, entity-neighbor, and domain-neighbor nodes.
+
+    Semantic matches come first (highest signal). Entity and domain channels
+    fill in up to _CHANNEL_LIMIT nodes each. The combined pool is deduped and
+    capped at INFERENCE_CONTEXT_SIZE. Only raw_input nodes are included so
+    inference nodes don't recursively feed more inference.
+    """
+    seen: set[str] = {new_id}
+    pool: list[dict] = []
+
+    for m in semantic:
+        if m["id"] not in seen:
+            seen.add(m["id"])
+            pool.append(m)
+
+    entity_links = (
+        db.client().table("node_entities").select("entity_id")
+        .eq("node_id", new_id).execute().data or []
+    )
+    for link in entity_links:
+        for n in db.nodes_by_entity(link["entity_id"], new_id, _CHANNEL_LIMIT):
+            if n["id"] not in seen:
+                seen.add(n["id"])
+                pool.append(n)
+
+    topic_links = (
+        db.client().table("node_topics").select("topic_id")
+        .eq("node_id", new_id).execute().data or []
+    )
+    for link in topic_links:
+        for n in db.nodes_by_topic(link["topic_id"], new_id, _CHANNEL_LIMIT):
+            if n["id"] not in seen:
+                seen.add(n["id"])
+                pool.append(n)
+
+    return pool[:INFERENCE_CONTEXT_SIZE]
 
 
 def _run_inference_step(
