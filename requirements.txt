@@ -1,7 +1,8 @@
 supabase>=2.4.0
 python-dotenv>=1.0.0
 sentence-transformers>=2.6.0  # local embeddings (all-MiniLM-L6-v2, padded to 1536)
-groq>=0.11.0            # llm_service.py (llama-3.3-70b-versatile)
+groq>=0.11.0            # llm_service.py primary backend (llama-3.3-70b-versatile)
+google-genai>=0.3.0     # llm_service.py failover backend (gemini-2.0-flash)
 requests>=2.31.0        # NewsAPI ingestion
 fastapi>=0.110.0        # HTTP API (main.py)
 uvicorn>=0.29.0         # ASGI server

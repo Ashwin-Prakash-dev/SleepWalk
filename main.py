@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import db
-from ingestion import ingest_from_newsapi, ingest_text
+from ingestion import ingest_from_newsapi, ingest_text, run_inference_batch
 
 # Columns returned to clients — everything except the 1536-dim embedding.
 NODE_COLUMNS = (
@@ -92,6 +92,15 @@ def ingest_news(body: NewsBody) -> dict:
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     return {"ingested_count": len(node_ids), "node_ids": node_ids}
+
+
+@app.post("/infer/run")
+def infer_run() -> dict:
+    """Manually flush the batched inference engine (force a partial batch)."""
+    try:
+        return run_inference_batch(force=True)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/nodes")

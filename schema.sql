@@ -29,8 +29,13 @@ create table if not exists nodes (
   event_date    timestamptz,
   expires_at    timestamptz,
   embedding     vector(1536),
+  -- false until the batched inference engine has paired this raw_input node.
+  -- See section 9 and ingestion.run_inference_batch.
+  inference_processed boolean default false,
   created_at    timestamptz default now()
 );
+-- Additive for DBs created before the batched inference engine existed.
+alter table nodes add column if not exists inference_processed boolean default false;
 
 create table if not exists edges (
   id         uuid primary key default gen_random_uuid(),
@@ -38,10 +43,17 @@ create table if not exists edges (
   target_id  uuid references nodes(id) on delete cascade,
   edge_type  text not null check (edge_type in (
                'same_subject', 'same_actor', 'semantically_similar',
-               'derives_from', 'contradicts')),
+               'derives_from', 'contradicts',
+               'corroborated_by', 'converges_with')),
   weight     float default 1.0,
   created_at timestamptz default now()
 );
+-- Additive for DBs whose edges CHECK predates the inference edge types. The
+-- constraint name is Postgres' default for the inline CHECK above.
+alter table edges drop constraint if exists edges_edge_type_check;
+alter table edges add constraint edges_edge_type_check check (edge_type in (
+  'same_subject', 'same_actor', 'semantically_similar',
+  'derives_from', 'contradicts', 'corroborated_by', 'converges_with'));
 
 -- node_entities: many-to-many between nodes and the entities they involve, with
 -- a role per link. Additive alongside nodes.entity_id (which stays the single
@@ -204,3 +216,47 @@ select id, entity_id, 'actor'
 from nodes
 where entity_id is not null
 on conflict (node_id, entity_id) do nothing;
+
+-- 9. Batched, adversarially-verified inference ------------------------------
+-- The inference *content* lives as a node (node_category='inference'); this
+-- companion table holds the verification verdict and provenance for that node.
+create table if not exists inference_meta (
+  node_id           uuid primary key references nodes(id) on delete cascade,
+  status            text not null check (status in ('contested', 'corroborated', 'unverified')),
+  base_confidence   float,          -- Pass 1 confidence, before coverage gating
+  coverage          float,          -- [0,1] corpus density around actor/subject/time
+  support_node_ids  uuid[] default '{}',
+  defeater_node_ids uuid[] default '{}',
+  alternatives      jsonb  default '[]',  -- [{explanation, evidence_signature, reportability, retrieved_ids, status}]
+  converged_with    uuid[] default '{}',  -- other inference node_ids that independently re-derive this one
+  created_at        timestamptz default now()
+);
+create index if not exists inference_meta_status_idx on inference_meta (status);
+
+-- Indexes for coverage estimation + structural evidence pulls (time windows).
+create index if not exists nodes_event_date_idx on nodes (event_date);
+create index if not exists nodes_created_at_idx on nodes (created_at);
+
+-- match_inferences: cosine KNN restricted to inference nodes. Used by Pass 3 to
+-- find semantically-equivalent existing inferences (convergence detection).
+create or replace function match_inferences(
+  query_embedding vector(1536),
+  match_threshold float default 0.90,
+  match_count int default 10
+)
+returns table (
+  id uuid,
+  content text,
+  confidence float,
+  similarity float
+)
+language sql stable as $$
+  select id, content, confidence,
+    1 - (embedding <=> query_embedding) as similarity
+  from nodes
+  where node_category = 'inference'
+    and embedding is not null
+    and 1 - (embedding <=> query_embedding) > match_threshold
+  order by embedding <=> query_embedding
+  limit match_count;
+$$;

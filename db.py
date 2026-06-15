@@ -27,6 +27,7 @@ NODE_KINDS: frozenset[str] = frozenset({
 EDGE_TYPES: frozenset[str] = frozenset({
     "same_subject", "same_actor", "semantically_similar",
     "derives_from", "contradicts",
+    "corroborated_by", "converges_with",
 })
 
 # An embedding is a 1536-element list of floats (vector(1536) in Postgres).
@@ -361,3 +362,169 @@ def stream_between_names(
     if a is None or b is None:
         return []
     return stream_between(a["id"], b["id"], max_count)
+
+
+# --- batched inference: queue, retrieval, metadata ---------------------------
+# Columns returned to the inference engine — everything it reasons over except
+# the 1536-dim embedding (embeddings are recomputed from `content` when needed,
+# which sidesteps parsing the pgvector wire format back into a list).
+INFERENCE_NODE_COLUMNS = (
+    "id,node_category,node_kind,actor,subject,confidence,content,"
+    "source_url,event_date,created_at"
+)
+
+
+def nodes_unprocessed_count() -> int:
+    """Count raw_input nodes not yet seen by the batched inference engine."""
+    resp = (
+        client()
+        .table("nodes")
+        .select("id", count="exact")
+        .eq("node_category", "raw_input")
+        .eq("inference_processed", False)
+        .execute()
+    )
+    return resp.count or 0
+
+
+def fetch_unprocessed_nodes(limit: int = 200) -> list[dict[str, Any]]:
+    """Oldest-first raw_input nodes with inference_processed = false."""
+    return (
+        client()
+        .table("nodes")
+        .select(INFERENCE_NODE_COLUMNS)
+        .eq("node_category", "raw_input")
+        .eq("inference_processed", False)
+        .order("created_at", desc=False)
+        .limit(limit)
+        .execute()
+        .data or []
+    )
+
+
+def mark_nodes_processed(ids: Sequence[str]) -> None:
+    """Flag nodes as processed so the next batch doesn't re-pair them."""
+    if not ids:
+        return
+    client().table("nodes").update({"inference_processed": True}).in_(
+        "id", list(ids)
+    ).execute()
+
+
+def nodes_by_ids(ids: Sequence[str], limit: int = 200) -> list[dict[str, Any]]:
+    """Fetch node rows (no embedding) for a set of ids."""
+    if not ids:
+        return []
+    return (
+        client()
+        .table("nodes")
+        .select(INFERENCE_NODE_COLUMNS)
+        .in_("id", list(ids))
+        .limit(limit)
+        .execute()
+        .data or []
+    )
+
+
+def nodes_by_actor(actor: str, limit: int = 20) -> list[dict[str, Any]]:
+    """Recent raw_input nodes with this exact actor (structural evidence pull)."""
+    if not actor:
+        return []
+    return (
+        client()
+        .table("nodes")
+        .select(INFERENCE_NODE_COLUMNS)
+        .eq("actor", actor)
+        .eq("node_category", "raw_input")
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+        .data or []
+    )
+
+
+def nodes_in_time_window(
+    start_iso: str, end_iso: str, limit: int = 200
+) -> list[dict[str, Any]]:
+    """raw_input nodes whose created_at falls in [start_iso, end_iso]."""
+    return (
+        client()
+        .table("nodes")
+        .select(INFERENCE_NODE_COLUMNS)
+        .eq("node_category", "raw_input")
+        .gte("created_at", start_iso)
+        .lte("created_at", end_iso)
+        .limit(limit)
+        .execute()
+        .data or []
+    )
+
+
+def neighbor_node_ids(node_id: str) -> list[str]:
+    """One-hop edge neighbors of a node (either direction), excluding itself."""
+    edges = (
+        client()
+        .table("edges")
+        .select("source_id,target_id")
+        .or_(f"source_id.eq.{node_id},target_id.eq.{node_id}")
+        .execute()
+        .data or []
+    )
+    ids = {e["source_id"] for e in edges} | {e["target_id"] for e in edges}
+    ids.discard(node_id)
+    return list(ids)
+
+
+def derives_from_targets(inference_id: str) -> list[str]:
+    """The source nodes an inference was derived from (its derives_from targets)."""
+    edges = (
+        client()
+        .table("edges")
+        .select("target_id")
+        .eq("source_id", inference_id)
+        .eq("edge_type", "derives_from")
+        .execute()
+        .data or []
+    )
+    return [e["target_id"] for e in edges]
+
+
+def match_inferences(
+    query_embedding: Embedding,
+    match_threshold: float = 0.90,
+    match_count: int = 10,
+) -> list[dict[str, Any]]:
+    """Call the `match_inferences` SQL function: inference nodes near an embedding."""
+    resp = client().rpc(
+        "match_inferences",
+        {
+            "query_embedding": list(query_embedding),
+            "match_threshold": match_threshold,
+            "match_count": match_count,
+        },
+    ).execute()
+    return resp.data or []
+
+
+def insert_inference_meta(
+    node_id: str,
+    status: str,
+    base_confidence: float,
+    coverage: float,
+    support_node_ids: Sequence[str],
+    defeater_node_ids: Sequence[str],
+    alternatives: Any,
+    converged_with: Optional[Sequence[str]] = None,
+) -> dict[str, Any]:
+    """Upsert the verification verdict + provenance for an inference node."""
+    payload: dict[str, Any] = {
+        "node_id": node_id,
+        "status": status,
+        "base_confidence": base_confidence,
+        "coverage": coverage,
+        "support_node_ids": list(support_node_ids or []),
+        "defeater_node_ids": list(defeater_node_ids or []),
+        "alternatives": alternatives or [],
+        "converged_with": list(converged_with or []),
+    }
+    return _first(client().table("inference_meta").upsert(payload).execute())

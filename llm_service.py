@@ -1,38 +1,66 @@
 """LLM extraction and inference for the Enceladus knowledge graph.
 
-Two entry points, both backed by Claude via the Anthropic Python SDK:
+Backed by two providers behind a small failover router (see `_complete_json`):
+Groq (llama-3.3-70b-versatile, primary) and Google Gemini (gemini-2.0-flash,
+secondary). The secondary exists purely to spread load and survive Groq's daily
+token cap — calls fail over to the next provider on a rate-limit/quota error.
+
+Entry points:
 
 - extract_node(text, source_url=None) -> dict
-    Pull one structured node out of a piece of raw text. The result keeps the
-    single primary `actor` field and additionally carries an `entities` list of
-    {"name", "role"} objects (role in actor|target|mentioned) for every entity
-    named in the text — additive, so existing consumers of `actor` are unaffected.
+    Pull one structured node out of a piece of raw text. Keeps the single primary
+    `actor` field and additionally carries an `entities` list of {"name", "role"}
+    objects plus a `domains` list — additive, so existing consumers are unaffected.
 
-- run_inference(new_node, similar_nodes) -> list[dict]
-    Compare a new node against semantically similar stored nodes and surface
-    logical relationships (contradiction, derives_from, supports, tension).
+- run_inference(new_node, similar_nodes) -> list[dict]   [legacy, unused by pipeline]
+    Compare a new node against similar stored nodes and surface relationships.
 
-Model: claude-sonnet-4-6 (as requested). Reads ANTHROPIC_API_KEY from the
-environment (see .env).
+- reason_pair / enumerate_alternatives / classify_evidence
+    The three staged calls of the batched, adversarially-verified inference engine
+    (ingestion.run_inference_batch).
+
+Reads GROQ_API_KEY and GEMINI_API_KEY from the environment (see .env).
 """
 from __future__ import annotations
 
 import json
+import os
+import sys
 from typing import Any, Optional
-from groq import Groq
+
 from dotenv import load_dotenv
+from groq import Groq
+
+# Set ENCELADUS_LLM_DEBUG=1 to log which provider served each call (observability
+# during bring-up; silent by default).
+_DEBUG = bool(os.environ.get("ENCELADUS_LLM_DEBUG"))
 
 load_dotenv()
 
-...
-MODEL = "llama-3.3-70b-versatile"
-_client: Optional[Groq] = None
+# --- providers ---------------------------------------------------------------
+GROQ_MODEL = "llama-3.3-70b-versatile"   # primary; strongest at strict JSON
+GEMINI_MODEL = "gemini-2.5-flash"        # secondary; chosen over Gemma for JSON reliability
+
+_groq_client: Optional[Groq] = None
+_gemini_client: Any = None
+
 
 def client() -> Groq:
-    global _client
-    if _client is None:
-        _client = Groq()
-    return _client
+    """Lazily-created, process-wide Groq client (kept for backwards compat)."""
+    global _groq_client
+    if _groq_client is None:
+        _groq_client = Groq()
+    return _groq_client
+
+
+def _gemini() -> Any:
+    """Lazily-created Google Gemini client (reads GEMINI_API_KEY/GOOGLE_API_KEY)."""
+    global _gemini_client
+    if _gemini_client is None:
+        from google import genai
+
+        _gemini_client = genai.Client()
+    return _gemini_client
 
 # --- prompts (verbatim) ------------------------------------------------------
 EXTRACT_SYSTEM_PROMPT = (
@@ -81,11 +109,6 @@ Only return inferences with confidence above 0.6. Return empty array if none are
 
 
 # --- helpers -----------------------------------------------------------------
-def _message_text(response: Any) -> str:
-    """Concatenate the text blocks of a Messages API response."""
-    return "".join(b.text for b in response.content if b.type == "text").strip()
-
-
 def _strip_code_fences(text: str) -> str:
     """Remove a ```json ... ``` wrapper if the model added one despite instructions."""
     if text.startswith("```"):
@@ -96,24 +119,77 @@ def _strip_code_fences(text: str) -> str:
     return text.strip()
 
 
-def _complete_json(system: str, prompt: str, *, max_tokens: int) -> Any:
-    last_error: Optional[Exception] = None
-    for _ in range(2):
-        response = client().chat.completions.create(
-            model=MODEL,
-            max_tokens=max_tokens,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
-            ],
+def _complete_groq(system: str, prompt: str, max_tokens: int) -> str:
+    response = client().chat.completions.create(
+        model=GROQ_MODEL,
+        max_tokens=max_tokens,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0,
+    )
+    return (response.choices[0].message.content or "").strip()
+
+
+def _complete_gemini(system: str, prompt: str, max_tokens: int) -> str:
+    from google.genai import types
+
+    # Disable "thinking" (gemini-2.5-flash enables it by default): thinking tokens
+    # otherwise eat the max_output_tokens budget and truncate the JSON response.
+    response = _gemini().models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=system,
             temperature=0,
-        )
-        try:
-            text = response.choices[0].message.content.strip()
-            return json.loads(_strip_code_fences(text))
-        except json.JSONDecodeError as exc:
-            last_error = exc
-    raise ValueError(f"Did not return valid JSON after one retry: {last_error}")
+            max_output_tokens=max_tokens,
+            response_mime_type="application/json",
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+        ),
+    )
+    return (response.text or "").strip()
+
+
+_PROVIDERS = {"groq": _complete_groq, "gemini": _complete_gemini}
+_DEFAULT_ORDER = ("groq", "gemini")
+
+
+def _provider_order(prefer: Optional[str]) -> tuple[str, ...]:
+    """Provider try-order; `prefer` (if valid) is moved to the front."""
+    if prefer in _PROVIDERS:
+        return (prefer,) + tuple(p for p in _DEFAULT_ORDER if p != prefer)
+    return _DEFAULT_ORDER
+
+
+def _complete_json(
+    system: str, prompt: str, *, max_tokens: int, prefer: Optional[str] = None
+) -> Any:
+    """Complete a JSON request, failing over across providers.
+
+    For each provider in order: retry once on a JSON parse error, but on any
+    provider-side error (rate-limit / quota / API failure) move on to the next
+    provider. Raises only when every provider has been exhausted. `prefer` biases
+    which provider is tried first (e.g. "gemini" for cheap/bulky Pass-1 calls,
+    to spare the scarce Groq token budget for Pass-2 verification).
+    """
+    last_error: Optional[Exception] = None
+    for name in _provider_order(prefer):
+        complete = _PROVIDERS[name]
+        for _ in range(2):  # one retry per provider, for transient JSON glitches
+            try:
+                text = complete(system, prompt, max_tokens)
+                parsed = json.loads(_strip_code_fences(text))
+                if _DEBUG:
+                    print(f"[llm] served by {name}", file=sys.stderr)
+                return parsed
+            except json.JSONDecodeError as exc:
+                last_error = exc
+                continue  # retry the same provider
+            except Exception as exc:  # rate-limit / quota / API error → next provider
+                last_error = exc
+                break
+    raise ValueError(f"No provider returned valid JSON: {last_error}")
 
 COREFERENCE_SYSTEM_PROMPT = (
     "You are an entity coreference resolver. "
@@ -240,3 +316,149 @@ def run_inference(new_node: dict, similar_nodes: list[dict]) -> list[dict]:
             if isinstance(value, list):
                 return value
     return []
+
+
+# --- batched inference: staged calls -----------------------------------------
+def _as_list(result: Any, *keys: str) -> list[dict]:
+    """Coerce an LLM result into a list, tolerating a {key: [...]} wrapper."""
+    if isinstance(result, list):
+        return result
+    if isinstance(result, dict):
+        for key in keys:
+            value = result.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
+REASON_PAIR_SYSTEM_PROMPT = (
+    "You are a reasoning engine. Given two events, state the single strongest NEW "
+    "logical inference that follows from combining them. Always respond with valid "
+    "JSON only. No preamble, no markdown."
+)
+
+REASON_PAIR_USER_PROMPT = """Two events have been observed. State the single strongest NEW logical inference that follows from COMBINING them — a conclusion neither event states on its own (a + b => c). It need NOT be a contradiction or agreement; it can be any causal link, implication, or consequence.
+
+EVENT A:
+actor={a_actor} | kind={a_kind} | subject={a_subject}
+{a_content}
+
+EVENT B:
+actor={b_actor} | kind={b_kind} | subject={b_subject}
+{b_content}
+
+Return a JSON object:
+- content: string (one clear sentence stating the inferred conclusion), or null if no meaningful new inference follows
+- confidence: float 0.0 to 1.0 (how strongly the two events jointly support this conclusion)
+- reasoning: string (one sentence explaining the logical step)
+
+If the events are unrelated, or one merely restates the other, return {{"content": null}}."""
+
+
+ALTERNATIVES_SYSTEM_PROMPT = (
+    "You are an adversarial verifier. For a proposed inference, enumerate competing "
+    "explanations that would account for the same observation. Always respond with "
+    "valid JSON only. No preamble, no markdown."
+)
+
+ALTERNATIVES_USER_PROMPT = """A proposed inference has been made:
+"{inference}"
+
+Enumerate up to {max_alternatives} COMPETING explanations — alternative accounts that, if true, would explain the same underlying observation differently and thereby undercut this inference. For each alternative provide:
+- explanation: string (one sentence stating the competing account)
+- evidence_signature: string (what a news report SUPPORTING this alternative would say, phrased AS the content of such a report so it can be matched against a corpus)
+- reportability: float 0.0 to 1.0 (if this alternative were true, how likely is it that evidence would appear in a news corpus — high for overt public actions, low for secret or private causes)
+
+Return a JSON array of alternative objects. Return an empty array [] if there are no credible competing explanations."""
+
+
+CLASSIFY_SYSTEM_PROMPT = (
+    "You are an evidence classifier. Classify each retrieved item as supporting the "
+    "inference, supporting a competing alternative, or irrelevant. Always respond "
+    "with valid JSON only. No preamble, no markdown."
+)
+
+CLASSIFY_USER_PROMPT = """INFERENCE:
+"{inference}"
+
+COMPETING ALTERNATIVES (0-indexed):
+{alternatives}
+
+RETRIEVED NODES (0-indexed):
+{nodes}
+
+For each retrieved node, classify it relative to the inference and the alternatives:
+- "supports_inference": the node is evidence FOR the inference.
+- "supports_alternative": the node is evidence for one of the competing alternatives (a defeater); set alternative_index to that alternative's 0-based index.
+- "irrelevant": the node supports neither the inference nor any alternative.
+
+Return a JSON array with one object per retrieved node, each:
+- index: integer (the node's 0-based index above)
+- label: one of "supports_inference", "supports_alternative", "irrelevant"
+- alternative_index: integer or null (required when label is "supports_alternative")"""
+
+
+def _format_alternatives(alternatives: list[dict]) -> str:
+    if not alternatives:
+        return "(none)"
+    lines = []
+    for i, a in enumerate(alternatives):
+        lines.append(f"[{i}] {a.get('explanation', '')}")
+    return "\n".join(lines)
+
+
+def reason_pair(node_a: dict, node_b: dict) -> dict:
+    """Pass 1: open-ended logical inference combining two events (a + b => c).
+
+    Returns {content, confidence, reasoning}, or {} if no meaningful inference
+    follows. Biased to the Gemini backend to spare the scarce Groq token budget.
+    """
+    prompt = REASON_PAIR_USER_PROMPT.format(
+        a_actor=node_a.get("actor") or "unknown",
+        a_kind=node_a.get("node_kind") or "unknown",
+        a_subject=node_a.get("subject") or "unknown",
+        a_content=node_a.get("content", ""),
+        b_actor=node_b.get("actor") or "unknown",
+        b_kind=node_b.get("node_kind") or "unknown",
+        b_subject=node_b.get("subject") or "unknown",
+        b_content=node_b.get("content", ""),
+    )
+    try:
+        result = _complete_json(
+            REASON_PAIR_SYSTEM_PROMPT, prompt, max_tokens=512, prefer="gemini"
+        )
+    except ValueError:
+        return {}
+    if isinstance(result, dict) and result.get("content"):
+        return result
+    return {}
+
+
+def enumerate_alternatives(inference_content: str, max_alternatives: int = 3) -> list[dict]:
+    """Pass 2a: competing explanations, each with evidence_signature + reportability."""
+    prompt = ALTERNATIVES_USER_PROMPT.format(
+        inference=inference_content, max_alternatives=max_alternatives
+    )
+    try:
+        result = _complete_json(ALTERNATIVES_SYSTEM_PROMPT, prompt, max_tokens=1024)
+    except ValueError:
+        return []
+    return _as_list(result, "alternatives", "results", "data")
+
+
+def classify_evidence(
+    inference_content: str, alternatives: list[dict], nodes: list[dict]
+) -> list[dict]:
+    """Pass 2c: label each retrieved node supports_inference/alternative/irrelevant."""
+    if not nodes:
+        return []
+    prompt = CLASSIFY_USER_PROMPT.format(
+        inference=inference_content,
+        alternatives=_format_alternatives(alternatives),
+        nodes=_format_similar_nodes(nodes),
+    )
+    try:
+        result = _complete_json(CLASSIFY_SYSTEM_PROMPT, prompt, max_tokens=2048)
+    except ValueError:
+        return []
+    return _as_list(result, "classifications", "results", "data")

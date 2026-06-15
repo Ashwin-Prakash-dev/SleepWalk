@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import requests
@@ -22,7 +23,13 @@ from dotenv import load_dotenv
 
 import db
 from embeddings import embed
-from llm_service import extract_node, resolve_entity_coreference, run_inference
+from llm_service import (
+    classify_evidence,
+    enumerate_alternatives,
+    extract_node,
+    reason_pair,
+    resolve_entity_coreference,
+)
 
 load_dotenv()
 
@@ -51,7 +58,30 @@ ENTITY_CANDIDATE_K = 5
 # merge; "energy" / "military conflict" should not).
 TOPIC_MATCH_THRESHOLD = 0.82
 
-_CHANNEL_LIMIT = 10  # max nodes pulled per entity/domain channel into inference pool
+# --- batched, adversarially-verified inference knobs -------------------------
+# All tunable; defaults are conservative because every stage is multi-LLM-call
+# and the free Groq tier caps daily tokens (Gemini failover absorbs overflow).
+INFERENCE_BATCH_SIZE        = 10    # unprocessed raw_input nodes that auto-trigger a pass
+PAIR_CANDIDATE_K            = 3     # partners kept per new node
+MAX_PAIRS_PER_BATCH         = 15    # hard cap on Pass-1 reasoning calls
+DUPLICATE_THRESHOLD         = 0.95  # cosine >= this => restatement, not an inference; skip
+MIN_PAIR_SIMILARITY         = 0.45  # cosine floor to pair / retrieve at all
+MAX_ALTERNATIVES            = 3     # competing explanations enumerated per inference
+EVIDENCE_RETRIEVAL_K        = 8     # semantic hits pulled per evidence signature
+EVIDENCE_CLASSIFY_CAP       = 20    # max nodes sent to the classifier prompt
+COVERAGE_SATURATION         = 12    # corpus node count at which coverage -> 1.0
+COVERAGE_CORROBORATION_MIN  = 0.5   # coverage below this can never reach 'corroborated'
+TIME_WINDOW_DAYS            = 30    # structural pull + coverage window around source dates
+HIGH_REPORTABILITY          = 0.6   # reportability >= this => silence about it is informative
+UNVERIFIED_CONFIDENCE_CAP   = 0.55  # confidence ceiling when status = unverified
+DEFEATER_PENALTY            = 0.5   # confidence multiplier when status = contested
+CORROBORATION_BONUS         = 0.25  # max additive bonus, scaled by coverage * mean reportability
+CONVERGENCE_THRESHOLD       = 0.82  # cosine for "the same inference" (calibrated for MiniLM scale)
+CONVERGENCE_BONUS           = 0.15  # additive per independent re-derivation (still coverage-gated)
+INDEPENDENCE_MAX_OVERLAP    = 0.34  # source-set Jaccard above which a rederivation is NOT independent
+
+# Module-level embedding cache, keyed by node id (content embeddings are stable).
+_emb_cache: dict[str, list[float]] = {}
 
 
 # --- small helpers -----------------------------------------------------------
@@ -265,90 +295,367 @@ def ingest_text(text: str, source_url: str = None) -> str:
         if sim > SIMILARITY_THRESHOLD and not _edge_exists(new_id, m["id"], "semantically_similar"):
             db.insert_edge(new_id, m["id"], "semantically_similar", weight=sim)
 
-    # Step 7 — inference with expanded pool (semantic + entity neighbors + domain neighbors).
-    context = _expand_inference_pool(new_id, similar)
-    _run_inference_step(node, new_id, actor, subject, context)
+    # Step 7 — inference is no longer inline. The node is left
+    # inference_processed=false; once INFERENCE_BATCH_SIZE such nodes accumulate,
+    # the batched engine pairs and verifies them.
+    maybe_run_inference_batch()
 
     return new_id
 
 
-def _expand_inference_pool(new_id: str, semantic: list[dict]) -> list[dict]:
-    """Merge semantic-similar, entity-neighbor, and domain-neighbor nodes.
+# --- batched, adversarially-verified inference engine ------------------------
+def maybe_run_inference_batch() -> Optional[dict]:
+    """Auto-trigger a batch once enough unprocessed nodes have accumulated."""
+    if db.nodes_unprocessed_count() >= INFERENCE_BATCH_SIZE:
+        return run_inference_batch()
+    return None
 
-    Semantic matches come first (highest signal). Entity and domain channels
-    fill in up to _CHANNEL_LIMIT nodes each. The combined pool is deduped and
-    capped at INFERENCE_CONTEXT_SIZE. Only raw_input nodes are included so
-    inference nodes don't recursively feed more inference.
+
+def run_inference_batch(force: bool = False) -> dict:
+    """Pair accumulated raw_input nodes, reason, verify, and persist inferences.
+
+    Returns a small summary dict. With force=True a partial batch (below
+    INFERENCE_BATCH_SIZE) is processed anyway — used by the CLI / endpoint flush.
     """
-    seen: set[str] = {new_id}
-    pool: list[dict] = []
+    count = db.nodes_unprocessed_count()
+    if count == 0 or (count < INFERENCE_BATCH_SIZE and not force):
+        return {"pairs": 0, "inferences": 0, "processed": 0, "skipped": count}
 
-    for m in semantic:
-        if m["id"] not in seen:
-            seen.add(m["id"])
-            pool.append(m)
+    new_nodes = db.fetch_unprocessed_nodes(limit=200)
+    pairs = _candidate_pairs(new_nodes)
 
-    entity_links = (
-        db.client().table("node_entities").select("entity_id")
-        .eq("node_id", new_id).execute().data or []
-    )
-    for link in entity_links:
-        for n in db.nodes_by_entity(link["entity_id"], new_id, _CHANNEL_LIMIT):
-            if n["id"] not in seen:
-                seen.add(n["id"])
-                pool.append(n)
-
-    topic_links = (
-        db.client().table("node_topics").select("topic_id")
-        .eq("node_id", new_id).execute().data or []
-    )
-    for link in topic_links:
-        for n in db.nodes_by_topic(link["topic_id"], new_id, _CHANNEL_LIMIT):
-            if n["id"] not in seen:
-                seen.add(n["id"])
-                pool.append(n)
-
-    return pool[:INFERENCE_CONTEXT_SIZE]
-
-
-def _run_inference_step(
-    node: dict,
-    new_id: str,
-    actor: Optional[str],
-    subject: Optional[str],
-    similar: list[dict],
-) -> None:
-    """Generate inference nodes and their derives_from/contradicts edges."""
-    for inf in run_inference(node, similar):
-        content = inf.get("content")
-        if not content:
+    created = 0
+    for node_a, node_b, _sim in pairs:
+        inf = reason_pair(node_a, node_b)
+        if not inf or not inf.get("content"):
             continue
-        inf_kind = inf.get("inference_kind")
+        base_conf = _to_float(inf.get("confidence"), 0.6)
+        verdict = _verify_inference(inf, node_a, node_b, base_conf)
+        _persist_inference(inf, node_a, node_b, base_conf, verdict)
+        created += 1
 
-        # inference_kind ∈ {contradiction, derives_from, supports, tension}, but the
-        # nodes CHECK constraint only allows 'contradiction'/'derived' here — map the
-        # rest to 'derived'. The relationship itself is carried by the edge type.
-        node_kind = inf_kind if inf_kind in db.NODE_KINDS else "derived"
-        edge_type = "contradicts" if inf_kind == "contradiction" else "derives_from"
+    new_ids = [n["id"] for n in new_nodes]
+    db.mark_nodes_processed(new_ids)
+    return {"pairs": len(pairs), "inferences": created, "processed": len(new_ids)}
 
-        inf_row = db.insert_node(
-            node_category="inference",
-            node_kind=node_kind,
-            content=content,
-            actor=actor,
-            subject=subject,
-            confidence=_to_float(inf.get("confidence"), 0.7),
-            embedding=embed(content),
+
+# --- small math / time helpers ----------------------------------------------
+def _node_embedding(node: dict) -> list[float]:
+    """Embedding for a node's content, cached by node id."""
+    nid = node.get("id")
+    if nid and nid in _emb_cache:
+        return _emb_cache[nid]
+    vec = embed(node.get("content", ""))
+    if nid:
+        _emb_cache[nid] = vec
+    return vec
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    """Dot product of two unit-normalised embeddings == cosine similarity."""
+    return sum(x * y for x, y in zip(a, b))
+
+
+def _parse_ts(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        s = value.replace("Z", "+00:00") if isinstance(value, str) else value
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+def _time_window(node_a: dict, node_b: dict) -> tuple[str, str]:
+    """ISO [start, end] spanning the two source dates +/- TIME_WINDOW_DAYS."""
+    dates = [
+        _parse_ts(n.get("event_date") or n.get("created_at")) for n in (node_a, node_b)
+    ]
+    dates = [d for d in dates if d]
+    span = timedelta(days=TIME_WINDOW_DAYS)
+    if not dates:
+        now = datetime.now(timezone.utc)
+        return (now - span).isoformat(), now.isoformat()
+    return (min(dates) - span).isoformat(), (max(dates) + span).isoformat()
+
+
+def _entity_ids(node_id: str) -> list[str]:
+    rows = (
+        db.client().table("node_entities").select("entity_id")
+        .eq("node_id", node_id).execute().data or []
+    )
+    return [r["entity_id"] for r in rows]
+
+
+def _topic_ids(node_id: str) -> list[str]:
+    rows = (
+        db.client().table("node_topics").select("topic_id")
+        .eq("node_id", node_id).execute().data or []
+    )
+    return [r["topic_id"] for r in rows]
+
+
+# --- Pass 1: candidate pairing ----------------------------------------------
+def _candidate_pairs(new_nodes: list[dict]) -> list[tuple[dict, dict, float]]:
+    """Pair each new node with its best non-duplicate partners across the graph.
+
+    Partners are gathered from the semantic, entity, and domain channels (whole
+    graph), scored by cosine, filtered (similarity floor, duplicate ceiling,
+    same-source independence), deduped by unordered id pair, and capped.
+    """
+    pairs: dict[frozenset, tuple[dict, dict, float]] = {}
+    for node_a in new_nodes:
+        a_emb = _node_embedding(node_a)
+        cand_ids: set[str] = set()
+
+        for m in db.match_nodes(a_emb, MIN_PAIR_SIMILARITY, PAIR_CANDIDATE_K + 5):
+            cand_ids.add(m["id"])
+        for eid in _entity_ids(node_a["id"]):
+            for n in db.nodes_by_entity(eid, node_a["id"], PAIR_CANDIDATE_K):
+                cand_ids.add(n["id"])
+        for tid in _topic_ids(node_a["id"]):
+            for n in db.nodes_by_topic(tid, node_a["id"], PAIR_CANDIDATE_K):
+                cand_ids.add(n["id"])
+        cand_ids.discard(node_a["id"])
+        if not cand_ids:
+            continue
+
+        scored: list[tuple[float, dict]] = []
+        for partner in db.nodes_by_ids(cand_ids):
+            if partner.get("node_category") != "raw_input":
+                continue
+            if partner.get("source_url") and partner["source_url"] == node_a.get("source_url"):
+                continue  # same article => not independent evidence
+            sim = _cosine(a_emb, _node_embedding(partner))
+            if sim < MIN_PAIR_SIMILARITY or sim >= DUPLICATE_THRESHOLD:
+                continue
+            scored.append((sim, partner))
+
+        scored.sort(key=lambda t: t[0], reverse=True)
+        for sim, partner in scored[:PAIR_CANDIDATE_K]:
+            key = frozenset((node_a["id"], partner["id"]))
+            if key not in pairs:
+                pairs[key] = (node_a, partner, sim)
+
+    ranked = sorted(pairs.values(), key=lambda t: t[2], reverse=True)
+    return ranked[:MAX_PAIRS_PER_BATCH]
+
+
+# --- Pass 2: adversarial verification ---------------------------------------
+def _hybrid_retrieve(
+    alternatives: list[dict], node_a: dict, node_b: dict
+) -> list[dict]:
+    """Evidence pool: cosine over each alternative's evidence_signature UNION a
+    structural pull (actor / entities / edges / time window) around the sources.
+
+    Ordered by channel priority (signature-semantic first, time-window last),
+    deduped preserving order, raw_input only, capped for the classifier prompt.
+    """
+    ordered_ids: list[str] = []
+    seen: set[str] = {node_a["id"], node_b["id"]}
+
+    def _add(node_id: str) -> None:
+        if node_id not in seen:
+            seen.add(node_id)
+            ordered_ids.append(node_id)
+
+    for alt in alternatives:
+        sig = (alt or {}).get("evidence_signature")
+        if not sig:
+            continue
+        for m in db.match_nodes(embed(sig), MIN_PAIR_SIMILARITY, EVIDENCE_RETRIEVAL_K):
+            _add(m["id"])
+
+    for node in (node_a, node_b):
+        for n in db.nodes_by_actor(node.get("actor"), 10):
+            _add(n["id"])
+        for eid in _entity_ids(node["id"]):
+            for n in db.nodes_by_entity(eid, node["id"], 10):
+                _add(n["id"])
+        for nid in db.neighbor_node_ids(node["id"]):
+            _add(nid)
+
+    start, end = _time_window(node_a, node_b)
+    for n in db.nodes_in_time_window(start, end, 50):
+        _add(n["id"])
+
+    rows = {r["id"]: r for r in db.nodes_by_ids(ordered_ids)}
+    evidence = [
+        rows[i] for i in ordered_ids
+        if i in rows and rows[i].get("node_category") == "raw_input"
+    ]
+    return evidence[:EVIDENCE_CLASSIFY_CAP]
+
+
+def _coverage(node_a: dict, node_b: dict) -> float:
+    """Density of related corpus around the sources, normalised to [0,1].
+
+    Counts raw_input nodes in the time window that share an actor or subject with
+    either source. High coverage => an absence of defeaters is informative.
+    """
+    start, end = _time_window(node_a, node_b)
+    window = db.nodes_in_time_window(start, end, 200)
+    actors = {node_a.get("actor"), node_b.get("actor")} - {None}
+    subjects = {node_a.get("subject"), node_b.get("subject")} - {None}
+    related = sum(
+        1 for n in window
+        if n.get("actor") in actors or n.get("subject") in subjects
+    )
+    return min(1.0, related / COVERAGE_SATURATION)
+
+
+def _coverage_ceiling(coverage: float) -> float:
+    """Hard cap on confidence as a function of coverage.
+
+    Thin coverage (0) caps at 0.40; full coverage (1) allows up to 0.95. This is
+    the invariant: 'nothing contradicted it' can never yield high confidence
+    unless the corpus around the claim is actually dense.
+    """
+    return 0.40 + 0.55 * coverage
+
+
+def _verify_inference(
+    inference: dict, node_a: dict, node_b: dict, base_conf: float
+) -> dict:
+    """Pass 2 a–e: alternatives -> hybrid retrieval -> classification -> status.
+
+    Returns the verdict dict consumed by _persist_inference.
+    """
+    content = inference["content"]
+    alternatives = enumerate_alternatives(content, MAX_ALTERNATIVES)[:MAX_ALTERNATIVES]
+    retrieved = _hybrid_retrieve(alternatives, node_a, node_b)
+    classifications = classify_evidence(content, alternatives, retrieved)
+
+    support_ids: list[str] = []
+    defeater_ids: list[str] = []
+    alt_supported: set[int] = set()
+    for c in classifications:
+        idx = c.get("index")
+        if not isinstance(idx, int) or not (0 <= idx < len(retrieved)):
+            continue
+        node_id = retrieved[idx]["id"]
+        label = c.get("label")
+        if label == "supports_inference":
+            support_ids.append(node_id)
+        elif label == "supports_alternative":
+            defeater_ids.append(node_id)
+            ai = c.get("alternative_index")
+            if isinstance(ai, int):
+                alt_supported.add(ai)
+
+    coverage = _coverage(node_a, node_b)
+
+    # Empty high-reportability alternatives = informative silence (counts FOR the
+    # inference); empty low-reportability alternatives count for nothing.
+    empty_high = [
+        _to_float(a.get("reportability"), 0.0)
+        for i, a in enumerate(alternatives)
+        if i not in alt_supported and _to_float(a.get("reportability"), 0.0) >= HIGH_REPORTABILITY
+    ]
+
+    if defeater_ids:
+        status = "contested"
+        conf = base_conf * DEFEATER_PENALTY
+    elif support_ids and coverage >= COVERAGE_CORROBORATION_MIN and empty_high:
+        status = "corroborated"
+        mean_rep = sum(empty_high) / len(empty_high)
+        conf = min(1.0, base_conf + CORROBORATION_BONUS * coverage * mean_rep)
+    else:
+        status = "unverified"
+        conf = min(base_conf, UNVERIFIED_CONFIDENCE_CAP)
+
+    # Always apply the coverage gate, regardless of branch.
+    conf = min(conf, _coverage_ceiling(coverage))
+
+    # Annotate alternatives for storage/audit.
+    for i, a in enumerate(alternatives):
+        a["had_support"] = i in alt_supported
+
+    return {
+        "status": status,
+        "confidence": conf,
+        "coverage": coverage,
+        "support_ids": support_ids,
+        "defeater_ids": defeater_ids,
+        "alternatives": alternatives,
+    }
+
+
+# --- Pass 3: convergence (independence-guarded) -----------------------------
+def _jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _detect_convergence(inf_embedding: list[float], source_ids: list[str]) -> list[str]:
+    """Existing inferences that independently re-derive this one.
+
+    A match counts only if its source-node set is largely DISJOINT from this
+    inference's sources (Jaccard <= INDEPENDENCE_MAX_OVERLAP) — same-evidence
+    rederivation is not corroboration.
+    """
+    convergent: list[str] = []
+    src = set(source_ids)
+    for m in db.match_inferences(inf_embedding, CONVERGENCE_THRESHOLD, 10):
+        existing_sources = set(db.derives_from_targets(m["id"]))
+        if not existing_sources:
+            continue
+        if _jaccard(src, existing_sources) <= INDEPENDENCE_MAX_OVERLAP:
+            convergent.append(m["id"])
+    return convergent
+
+
+def _persist_inference(
+    inference: dict, node_a: dict, node_b: dict, base_conf: float, verdict: dict
+) -> str:
+    """Insert the inference node + meta + verification/convergence edges."""
+    content = inference["content"]
+    emb = embed(content)
+    source_ids = [node_a["id"], node_b["id"]]
+
+    # Detect convergence BEFORE insert so we don't match the row against itself.
+    convergent = _detect_convergence(emb, source_ids)
+    conf = verdict["confidence"]
+    if convergent:
+        conf = min(
+            _coverage_ceiling(verdict["coverage"]),
+            conf + CONVERGENCE_BONUS * len(convergent),
         )
-        inf_id = inf_row["id"]
 
-        # Edges to the stored nodes that support this inference.
-        for idx in inf.get("source_node_indices") or []:
-            if isinstance(idx, int) and 0 <= idx < len(similar):
-                db.insert_edge(inf_id, similar[idx]["id"], edge_type)
+    inf_row = db.insert_node(
+        node_category="inference",
+        node_kind="derived",          # verdict lives in inference_meta.status, not node_kind
+        content=content,
+        actor=node_a.get("actor"),
+        subject=node_a.get("subject"),
+        confidence=conf,
+        embedding=emb,
+    )
+    inf_id = inf_row["id"]
 
-        # And a derives_from edge back to the node that triggered the inference.
-        db.insert_edge(inf_id, new_id, "derives_from")
+    db.insert_inference_meta(
+        inf_id,
+        status=verdict["status"],
+        base_confidence=base_conf,
+        coverage=verdict["coverage"],
+        support_node_ids=verdict["support_ids"],
+        defeater_node_ids=verdict["defeater_ids"],
+        alternatives=verdict["alternatives"],
+        converged_with=convergent,
+    )
+
+    # Provenance + verification graph.
+    db.insert_edge(inf_id, node_a["id"], "derives_from")
+    db.insert_edge(inf_id, node_b["id"], "derives_from")
+    for sid in verdict["support_ids"]:
+        db.insert_edge(inf_id, sid, "corroborated_by")
+    for did in verdict["defeater_ids"]:
+        db.insert_edge(inf_id, did, "contradicts")
+    for cid in convergent:
+        db.insert_edge(inf_id, cid, "converges_with")
+    return inf_id
 
 
 def ingest_from_newsapi(query: str, page_size: int = 10) -> list[str]:
@@ -394,5 +701,9 @@ if __name__ == "__main__":
 
     if len(sys.argv) < 2:
         print('usage: python ingestion.py "<text to ingest>"')
+        print("       python ingestion.py --infer   # flush the inference batch")
         raise SystemExit(1)
-    print(ingest_text(sys.argv[1]))
+    if sys.argv[1] == "--infer":
+        print(run_inference_batch(force=True))
+    else:
+        print(ingest_text(sys.argv[1]))

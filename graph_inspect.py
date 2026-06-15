@@ -19,15 +19,47 @@ print("\n=== INFERENCE NODES (top 20 by confidence) ===")
 inferences = (
     db.client()
     .table("nodes")
-    .select("node_kind,actor,subject,confidence,content")
+    .select("id,confidence,content")
     .eq("node_category", "inference")
     .order("confidence", desc=True)
-    .limit(20)
+    .limit(80)
     .execute()
     .data
 )
+meta_rows = db.client().table("inference_meta").select("*").execute().data
+meta = {m["node_id"]: m for m in meta_rows}
+
+status_counts: dict[str, int] = {}
 for n in inferences:
-    print(f"  [{n['node_kind']}] conf={n['confidence']:.2f}  {n['content'][:90]}")
+    m = meta.get(n["id"], {})
+    status = m.get("status", "?")
+    status_counts[status] = status_counts.get(status, 0) + 1
+    cov = m.get("coverage")
+    base = m.get("base_confidence")
+    sup = len(m.get("support_node_ids") or [])
+    defs = len(m.get("defeater_node_ids") or [])
+    conv = len(m.get("converged_with") or [])
+    cov_s = f"{cov:.2f}" if isinstance(cov, (int, float)) else "?"
+    base_s = f"{base:.2f}" if isinstance(base, (int, float)) else "?"
+    flags = f"sup={sup} def={defs}" + (f" conv={conv}" if conv else "")
+    print(
+        f"  [{status:11}] cov={cov_s} base={base_s} -> conf={n['confidence']:.2f} "
+        f"| {flags}\n      {n['content'][:88]}"
+    )
+print(f"\n  status tally: {status_counts}")
+
+print("\n=== CONVERGENCE (independently re-derived inferences) ===")
+conv_edges = (
+    db.client().table("edges").select("source_id,target_id")
+    .eq("edge_type", "converges_with").execute().data or []
+)
+content_by_id = {n["id"]: n["content"] for n in inferences}
+if not conv_edges:
+    print("  (none)")
+for e in conv_edges:
+    a = content_by_id.get(e["source_id"], "?")
+    b = content_by_id.get(e["target_id"], "?")
+    print(f"  - {a[:72]}\n    <=> {b[:72]}")
 
 print("\n=== STREAM: United States <-> Iran ===")
 rows = db.stream_between_names("United States", "Iran")
