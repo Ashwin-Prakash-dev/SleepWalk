@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Enceladus — Knowledge Graph</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --panel2: #1c232c; --border: #2a3340;
+    --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --red: #f85149; --amber: #d29922; --gray: #8b949e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, "Segoe UI", system-ui, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 24px; border-bottom: 1px solid var(--border); background: var(--panel);
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 18px; margin: 0; letter-spacing: .5px; }
+  header h1 small { color: var(--muted); font-weight: 400; font-size: 12px; margin-left: 8px; }
+  button { font: inherit; cursor: pointer; }
+  .btn {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 12px;
+  }
+  .btn:hover { border-color: var(--accent); }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 20px 24px 60px; }
+
+  .stats { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 8px; }
+  .stat {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 16px; min-width: 96px;
+  }
+  .stat .n { font-size: 22px; font-weight: 600; }
+  .stat .l { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
+
+  .tally { display: flex; gap: 8px; flex-wrap: wrap; margin: 14px 0 20px; }
+  .chip {
+    border-radius: 999px; padding: 4px 12px; font-size: 13px; font-weight: 600;
+    border: 1px solid var(--border);
+  }
+  .chip.corroborated { background: rgba(63,185,80,.15); color: var(--green); border-color: rgba(63,185,80,.4); }
+  .chip.contested { background: rgba(248,81,73,.15); color: var(--red); border-color: rgba(248,81,73,.4); }
+  .chip.unverified { background: rgba(210,153,34,.15); color: var(--amber); border-color: rgba(210,153,34,.4); }
+  .chip.unknown { background: rgba(139,148,158,.15); color: var(--gray); }
+
+  nav.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 20px; }
+  nav.tabs button {
+    background: none; border: none; color: var(--muted); padding: 10px 16px;
+    border-bottom: 2px solid transparent; font-weight: 600;
+  }
+  nav.tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+
+  .filters { display: flex; gap: 8px; margin-bottom: 16px; }
+  .filters button { background: none; border: 1px solid var(--border); color: var(--muted);
+    border-radius: 6px; padding: 5px 12px; }
+  .filters button.active { color: var(--text); border-color: var(--accent); background: var(--panel2); }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px; margin-bottom: 12px; border-left: 4px solid var(--gray);
+  }
+  .card.corroborated { border-left-color: var(--green); }
+  .card.contested { border-left-color: var(--red); }
+  .card.unverified { border-left-color: var(--amber); }
+  .card-head { display: flex; justify-content: space-between; gap: 16px; cursor: pointer; }
+  .card-content { font-size: 15px; }
+  .badge {
+    flex-shrink: 0; align-self: flex-start; border-radius: 6px; padding: 3px 10px;
+    font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px;
+  }
+  .badge.corroborated { background: rgba(63,185,80,.15); color: var(--green); }
+  .badge.contested { background: rgba(248,81,73,.15); color: var(--red); }
+  .badge.unverified { background: rgba(210,153,34,.15); color: var(--amber); }
+  .badge.unknown { background: rgba(139,148,158,.15); color: var(--gray); }
+
+  .meta-row { display: flex; align-items: center; gap: 18px; margin-top: 12px; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
+  .conf { color: var(--text); font-weight: 600; }
+  .arrow { color: var(--muted); }
+  .cov-bar { width: 120px; height: 7px; background: var(--panel2); border-radius: 4px; overflow: hidden; display: inline-block; vertical-align: middle; }
+  .cov-fill { height: 100%; background: var(--accent); }
+  .counts span { margin-right: 12px; }
+  .counts b { color: var(--text); }
+
+  .details { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); display: none; }
+  .details.open { display: block; }
+  .sect { margin-bottom: 14px; }
+  .sect h4 { margin: 0 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
+  .ev { background: var(--panel2); border-radius: 6px; padding: 8px 10px; margin-bottom: 6px; font-size: 13px; }
+  .alt { background: var(--panel2); border-radius: 6px; padding: 10px; margin-bottom: 8px; }
+  .alt .exp { font-size: 13px; }
+  .alt .sig { color: var(--muted); font-size: 12px; font-style: italic; margin-top: 4px; }
+  .alt-meta { display: flex; gap: 10px; align-items: center; margin-top: 6px; font-size: 12px; }
+  .tag { border-radius: 4px; padding: 2px 8px; font-size: 11px; font-weight: 600; }
+  .tag.silence { background: rgba(63,185,80,.15); color: var(--green); }
+  .tag.evidence { background: rgba(248,81,73,.15); color: var(--red); }
+  .rep { color: var(--muted); }
+
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 13px; vertical-align: top; }
+  th { color: var(--muted); text-transform: uppercase; font-size: 11px; letter-spacing: .5px; }
+  .alias { color: var(--muted); font-size: 12px; }
+  .kind { color: var(--accent); font-size: 12px; }
+  .loading, .empty { color: var(--muted); padding: 40px; text-align: center; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ENCELADUS <small id="subtitle">knowledge graph</small></h1>
+  <button class="btn" id="refresh">↻ Refresh</button>
+</header>
+
+<div class="wrap">
+  <div id="stats" class="stats"></div>
+  <div id="tally" class="tally"></div>
+
+  <nav class="tabs">
+    <button data-tab="inferences" class="active">Inferences</button>
+    <button data-tab="events">Events</button>
+    <button data-tab="entities">Entities</button>
+    <button data-tab="topics">Topics</button>
+  </nav>
+
+  <div id="tab-inferences">
+    <div class="filters" id="filters">
+      <button data-f="all" class="active">All</button>
+      <button data-f="corroborated">Corroborated</button>
+      <button data-f="contested">Contested</button>
+      <button data-f="unverified">Unverified</button>
+    </div>
+    <div id="inferences"><div class="loading">Loading…</div></div>
+  </div>
+
+  <div id="tab-events" class="hidden"></div>
+  <div id="tab-entities" class="hidden"></div>
+  <div id="tab-topics" class="hidden"></div>
+</div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+const pct = (x) => (x == null ? "–" : Math.round(x * 100) + "%");
+const f2 = (x) => (x == null ? "–" : Number(x).toFixed(2));
+
+let DATA = null;
+let filter = "all";
+
+async function load() {
+  $("#inferences").innerHTML = '<div class="loading">Loading…</div>';
+  try {
+    const r = await fetch("/dashboard/data");
+    DATA = await r.json();
+  } catch (e) {
+    $("#inferences").innerHTML = '<div class="empty">Failed to load /dashboard/data — is the server running?</div>';
+    return;
+  }
+  renderStats();
+  renderInferences();
+  renderEvents();
+  renderEntities();
+  renderTopics();
+}
+
+function renderStats() {
+  const s = DATA.stats;
+  $("#stats").innerHTML = [
+    ["events", s.raw], ["inferences", s.inference], ["entities", s.entities],
+    ["topics", s.topics], ["edges", s.edges],
+  ].map(([l, n]) => `<div class="stat"><div class="n">${n}</div><div class="l">${l}</div></div>`).join("");
+
+  const order = ["corroborated", "contested", "unverified", "unknown"];
+  const t = s.status_tally || {};
+  $("#tally").innerHTML = order.filter((k) => t[k]).map((k) =>
+    `<span class="chip ${k}">${k}: ${t[k]}</span>`).join("");
+  $("#subtitle").textContent = `${s.inference} inferences over ${s.raw} events`;
+}
+
+function evList(items) {
+  if (!items || !items.length) return '<div class="ev" style="color:var(--muted)">none</div>';
+  return items.map((x) => `<div class="ev">${esc(x.content)}</div>`).join("");
+}
+
+function altList(alts) {
+  if (!alts || !alts.length) return '<div class="ev" style="color:var(--muted)">none enumerated</div>';
+  return alts.map((a) => {
+    const had = a.had_support;
+    const tag = had
+      ? '<span class="tag evidence">evidence found → defeater</span>'
+      : '<span class="tag silence">no evidence (silence)</span>';
+    return `<div class="alt">
+      <div class="exp">${esc(a.explanation)}</div>
+      ${a.evidence_signature ? `<div class="sig">signature: ${esc(a.evidence_signature)}</div>` : ""}
+      <div class="alt-meta">${tag}<span class="rep">reportability ${f2(a.reportability)}</span></div>
+    </div>`;
+  }).join("");
+}
+
+function renderInferences() {
+  const list = (DATA.inferences || []).filter((i) => filter === "all" || i.status === filter);
+  if (!list.length) { $("#inferences").innerHTML = '<div class="empty">No inferences for this filter.</div>'; return; }
+  $("#inferences").innerHTML = list.map((i, idx) => {
+    const cov = i.coverage == null ? 0 : i.coverage;
+    return `<div class="card ${i.status}">
+      <div class="card-head" onclick="toggle(${idx})">
+        <div class="card-content">${esc(i.content)}</div>
+        <span class="badge ${i.status}">${i.status}</span>
+      </div>
+      <div class="meta-row">
+        <span>conf <span class="conf">${f2(i.base_confidence)}</span> <span class="arrow">→</span> <span class="conf">${f2(i.confidence)}</span></span>
+        <span>coverage <span class="cov-bar"><span class="cov-fill" style="width:${pct(cov)}"></span></span> ${pct(cov)}</span>
+        <span class="counts">
+          <span>sources <b>${i.sources.length}</b></span>
+          <span>support <b>${i.support.length}</b></span>
+          <span>defeaters <b>${i.defeaters.length}</b></span>
+          <span>converged <b>${i.converged_with.length}</b></span>
+        </span>
+      </div>
+      <div class="details" id="d${idx}">
+        <div class="sect"><h4>Derived from (a + b ⇒ c)</h4>${evList(i.sources)}</div>
+        <div class="sect"><h4>Competing explanations (Pass 2)</h4>${altList(i.alternatives)}</div>
+        <div class="sect"><h4>Supporting evidence</h4>${evList(i.support)}</div>
+        <div class="sect"><h4>Defeaters</h4>${evList(i.defeaters)}</div>
+        ${i.converged_with.length ? `<div class="sect"><h4>Converges with (independent re-derivation)</h4>${evList(i.converged_with)}</div>` : ""}
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function toggle(idx) { $("#d" + idx).classList.toggle("open"); }
+
+function renderEvents() {
+  const rows = (DATA.events || []).map((n) => `<tr>
+    <td class="kind">${esc(n.node_kind)}</td>
+    <td>${esc(n.actor || "–")}</td>
+    <td>${esc(n.subject || "–")}</td>
+    <td>${esc(n.content)}</td></tr>`).join("");
+  $("#tab-events").innerHTML = `<table><thead><tr><th>Kind</th><th>Actor</th><th>Subject</th><th>Content</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderEntities() {
+  const rows = (DATA.entities || []).map((e) => {
+    const al = (e.aliases || []).filter((a) => a !== e.name);
+    return `<tr><td>${esc(e.name)}</td><td class="alias">${al.length ? esc(al.join(", ")) : "–"}</td></tr>`;
+  }).join("");
+  $("#tab-entities").innerHTML = `<table><thead><tr><th>Entity</th><th>Aliases</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderTopics() {
+  const rows = (DATA.topics || []).map((t) => {
+    const al = (t.aliases || []).filter((a) => a !== t.name);
+    return `<tr><td>${esc(t.name)}</td><td class="alias">${al.length ? esc(al.join(", ")) : "–"}</td></tr>`;
+  }).join("");
+  $("#tab-topics").innerHTML = `<table><thead><tr><th>Topic</th><th>Aliases</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+// tab switching
+document.querySelectorAll("nav.tabs button").forEach((b) => b.onclick = () => {
+  document.querySelectorAll("nav.tabs button").forEach((x) => x.classList.toggle("active", x === b));
+  ["inferences", "events", "entities", "topics"].forEach((t) =>
+    $("#tab-" + t).classList.toggle("hidden", t !== b.dataset.tab));
+});
+
+// status filter
+$("#filters").querySelectorAll("button").forEach((b) => b.onclick = () => {
+  $("#filters").querySelectorAll("button").forEach((x) => x.classList.toggle("active", x === b));
+  filter = b.dataset.f;
+  renderInferences();
+});
+
+$("#refresh").onclick = load;
+load();
+</script>
+</body>
+</html>

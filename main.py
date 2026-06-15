@@ -3,8 +3,11 @@
 Run:  python main.py        (or: uvicorn main:app --port 8000)
 
 Endpoints:
+  GET  /dashboard         single-page UI for browsing inferences/events/entities
+  GET  /dashboard/data    aggregate JSON powering the dashboard
   POST /ingest            ingest one piece of text
   POST /ingest/news       ingest a batch from NewsAPI
+  POST /infer/run         flush the batched inference engine
   GET  /nodes             list nodes (filterable)
   GET  /nodes/{id}/graph  one-hop provenance trace around a node
   GET  /inferences        list inference nodes
@@ -12,11 +15,13 @@ Endpoints:
 """
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 import db
@@ -58,6 +63,89 @@ class NewsBody(BaseModel):
 @app.get("/")
 def health() -> dict:
     return {"status": "ok", "service": "enceladus"}
+
+
+# --- dashboard ---------------------------------------------------------------
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard() -> HTMLResponse:
+    """Serve the single-page dashboard."""
+    path = os.path.join(os.path.dirname(__file__), "dashboard.html")
+    with open(path, encoding="utf-8") as fh:
+        return HTMLResponse(fh.read())
+
+
+@app.get("/dashboard/data")
+def dashboard_data() -> dict:
+    """One aggregate payload powering the dashboard.
+
+    Joins inference nodes with their inference_meta verdicts and resolves the
+    source / support / defeater / convergence node ids to their content, so the
+    client renders the full verification picture without N+1 round trips.
+    """
+    c = db.client()
+    nodes = (
+        c.table("nodes")
+        .select("id,node_category,node_kind,actor,subject,confidence,content,source_url,created_at")
+        .order("created_at", desc=True)
+        .execute()
+        .data
+    )
+    content_by_id = {n["id"]: n["content"] for n in nodes}
+    raw = [n for n in nodes if n["node_category"] == "raw_input"]
+    inf_nodes = [n for n in nodes if n["node_category"] == "inference"]
+
+    meta = {m["node_id"]: m for m in c.table("inference_meta").select("*").execute().data}
+    edges = c.table("edges").select("source_id,target_id,edge_type").execute().data
+
+    sources_by_inf: dict[str, list[str]] = {}
+    for e in edges:
+        if e["edge_type"] == "derives_from":
+            sources_by_inf.setdefault(e["source_id"], []).append(e["target_id"])
+
+    def brief(ids: Optional[list]) -> list[dict]:
+        return [{"id": i, "content": content_by_id.get(i, "(unknown)")} for i in (ids or [])]
+
+    inferences = []
+    for n in inf_nodes:
+        m = meta.get(n["id"], {})
+        inferences.append({
+            "id": n["id"],
+            "content": n["content"],
+            "actor": n["actor"],
+            "subject": n["subject"],
+            "confidence": n["confidence"],
+            "status": m.get("status", "unknown"),
+            "base_confidence": m.get("base_confidence"),
+            "coverage": m.get("coverage"),
+            "sources": brief(sources_by_inf.get(n["id"])),
+            "support": brief(m.get("support_node_ids")),
+            "defeaters": brief(m.get("defeater_node_ids")),
+            "converged_with": brief(m.get("converged_with")),
+            "alternatives": m.get("alternatives") or [],
+        })
+    inferences.sort(key=lambda x: x["confidence"] or 0, reverse=True)
+
+    tally: dict[str, int] = {}
+    for i in inferences:
+        tally[i["status"]] = tally.get(i["status"], 0) + 1
+
+    entities = c.table("entities").select("name,aliases,created_at").order("name").execute().data
+    topics = c.table("topics").select("name,aliases,created_at").order("name").execute().data
+
+    return {
+        "stats": {
+            "raw": len(raw),
+            "inference": len(inf_nodes),
+            "entities": len(entities),
+            "topics": len(topics),
+            "edges": len(edges),
+            "status_tally": tally,
+        },
+        "inferences": inferences,
+        "events": raw,
+        "entities": entities,
+        "topics": topics,
+    }
 
 
 @app.post("/ingest")
