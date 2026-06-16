@@ -86,10 +86,18 @@ CONVERGENCE_BONUS           = 0.15  # additive per independent re-derivation (st
 INDEPENDENCE_MAX_OVERLAP    = 0.34  # source-set Jaccard above which a rederivation is NOT independent
 
 # --- forward-chaining (derived nodes as premises) ----------------------------
-# Phase 1: a corroborated inference may itself become a PREMISE for new reasoning,
-# enabling multi-hop derivation. Guarded hard — see [[inference-forward-chaining-design]].
+# A corroborated inference may itself become a PREMISE for new reasoning, enabling
+# multi-hop derivation. Guarded hard — see [[inference-forward-chaining-design]].
 PROMOTE_THRESHOLD       = 0.7   # min confidence + 'corroborated' status to be reusable as a premise
-MAX_DERIVATION_DEPTH    = 2     # cap on derived-node depth (raw=0); Phase 2 raises this
+MAX_DERIVATION_DEPTH    = 3     # cap on derived-node depth (raw=0)
+
+# Phase 2: iterative deepening. After a pass creates inferences, the trustworthy
+# (corroborated, >=PROMOTE_THRESHOLD, still below the depth cap) ones are fed back
+# in as premises for another pass, until none qualify (fixpoint) or the budget runs
+# out. Termination is triple-guarded: fixpoint, the depth cap, and the pair budget.
+MAX_PAIRS_PER_LEVEL     = 15    # pairs reasoned per deepening pass
+DEEPEN_GLOBAL_PAIR_CAP  = 45    # hard cap on pairs across all passes of one batch
+MAX_DEEPEN_PASSES       = 4     # belt-and-suspenders cap on pass count
 
 # Module-level embedding cache, keyed by node id (content embeddings are stable).
 _emb_cache: dict[str, list[float]] = {}
@@ -373,7 +381,9 @@ def maybe_run_inference_batch() -> Optional[dict]:
 
 
 def run_inference_batch(force: bool = False) -> dict:
-    """Pair accumulated raw_input nodes, reason, verify, and persist inferences.
+    """Pair accumulated raw_input nodes, reason, verify, and persist inferences,
+    then iteratively deepen: trustworthy new conclusions become premises for
+    further passes until a fixpoint / depth cap / pair budget is reached.
 
     Returns a small summary dict. With force=True a partial batch (below
     INFERENCE_BATCH_SIZE) is processed anyway — used by the CLI / endpoint flush.
@@ -383,22 +393,50 @@ def run_inference_batch(force: bool = False) -> dict:
         return {"pairs": 0, "inferences": 0, "processed": 0, "skipped": count}
 
     new_nodes = db.fetch_unprocessed_nodes(limit=200)
-    pairs = _candidate_pairs(new_nodes)
+    raw_ids = [n["id"] for n in new_nodes]
 
-    created = 0
-    for node_a, node_b, _sim in pairs:
-        inf = reason_pair(node_a, node_b)
-        if not inf or not inf.get("content"):
-            continue
-        base_conf = _to_float(inf.get("confidence"), 0.6)
-        base_conf = _propagate_confidence(base_conf, node_a, node_b)
-        verdict = _verify_inference(inf, node_a, node_b, base_conf)
-        _persist_inference(inf, node_a, node_b, base_conf, verdict)
-        created += 1
+    # Iterative deepening: each pass pairs its `frontier`, persists inferences, and
+    # promotes the trustworthy new ones into the next pass's frontier. Stops at a
+    # fixpoint (nothing promotable), the depth cap, or the global pair budget.
+    frontier = new_nodes
+    seen_ids = set(raw_ids)
+    total_pairs = total_created = passes = 0
+    budget = DEEPEN_GLOBAL_PAIR_CAP
 
-    new_ids = [n["id"] for n in new_nodes]
-    db.mark_nodes_processed(new_ids)
-    return {"pairs": len(pairs), "inferences": created, "processed": len(new_ids)}
+    while frontier and budget > 0 and passes < MAX_DEEPEN_PASSES:
+        passes += 1
+        pairs = _candidate_pairs(frontier)[: min(MAX_PAIRS_PER_LEVEL, budget)]
+        budget -= len(pairs)
+        total_pairs += len(pairs)
+
+        created_nodes: list[dict] = []
+        for node_a, node_b, _sim in pairs:
+            inf = reason_pair(node_a, node_b)
+            if not inf or not inf.get("content"):
+                continue
+            base_conf = _propagate_confidence(_to_float(inf.get("confidence"), 0.6), node_a, node_b)
+            verdict = _verify_inference(inf, node_a, node_b, base_conf)
+            created_nodes.append(_persist_inference(inf, node_a, node_b, base_conf, verdict))
+            total_created += 1
+
+        # Promote only conclusions trustworthy enough to be premises and still able
+        # to go deeper; dedupe against everything already used as a frontier node.
+        frontier = [
+            c for c in created_nodes
+            if c.get("status") == "corroborated"
+            and _to_float(c.get("confidence"), 0.0) >= PROMOTE_THRESHOLD
+            and _node_depth(c) < MAX_DERIVATION_DEPTH
+            and c["id"] not in seen_ids
+        ]
+        seen_ids.update(c["id"] for c in frontier)
+
+    db.mark_nodes_processed(raw_ids)
+    return {
+        "pairs": total_pairs,
+        "inferences": total_created,
+        "processed": len(raw_ids),
+        "passes": passes,
+    }
 
 
 # --- small math / time helpers ----------------------------------------------
@@ -765,8 +803,12 @@ def _detect_convergence(inf_embedding: list[float], source_roots: list[str]) -> 
 
 def _persist_inference(
     inference: dict, node_a: dict, node_b: dict, base_conf: float, verdict: dict
-) -> str:
-    """Insert the inference node + meta + verification/convergence edges."""
+) -> dict:
+    """Insert the inference node + meta + verification/convergence edges.
+
+    Returns the persisted node row augmented with its verification `status`, so the
+    deepening loop can feed trustworthy conclusions back in as premises.
+    """
     content = inference["content"]
     emb = embed(content)
     # Independence is judged on transitive raw grounding, so a derived premise
@@ -819,7 +861,11 @@ def _persist_inference(
         db.insert_edge(inf_id, did, "contradicts")
     for cid in convergent:
         db.insert_edge(inf_id, cid, "converges_with")
-    return inf_id
+
+    # Return the persisted row (+ status) so the deepening loop can decide whether
+    # this conclusion is trustworthy enough to itself become a premise next pass.
+    inf_row["status"] = verdict["status"]
+    return inf_row
 
 
 def ingest_from_newsapi(query: str, page_size: int = 10) -> list[str]:

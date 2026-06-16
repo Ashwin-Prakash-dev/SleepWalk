@@ -20,6 +20,7 @@ from __future__ import annotations
 import sys
 
 import db
+import seed_roots
 from ingestion import ingest_text, run_inference_batch
 
 SAMPLES: list[tuple[str, str]] = [
@@ -148,6 +149,12 @@ def reset() -> None:
 def main() -> None:
     if "--reset" in sys.argv:
         reset()
+
+    # Seed curated topic roots BEFORE ingesting, so each new topic is placed under
+    # them as it's created (avoids the academic-discipline mega-roots a root-less
+    # placement produces). Idempotent — safe with or without --reset.
+    print("seeding topic roots ...")
+    seed_roots.seed_roots()
 
     for i, (text, url) in enumerate(SAMPLES, 1):
         try:
