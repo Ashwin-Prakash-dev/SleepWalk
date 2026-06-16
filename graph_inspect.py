@@ -73,22 +73,18 @@ print(f"  {len(rows)} nodes")
 for r in rows[:8]:
     print(f"  [{r['node_kind']}] {r['content'][:80]}")
 
-print("\n=== CROSS-DOMAIN CHECK: nodes in BOTH 'energy' and 'military' topics ===")
-energy_topic = db.find_topic("energy") or db.find_topic("energy exports") or db.find_topic("oil exports")
-mil_topic    = db.find_topic("military") or db.find_topic("military conflict") or db.find_topic("military action")
-if energy_topic and mil_topic:
-    energy_ids = {
-        r["node_id"]
-        for r in db.client().table("node_topics").select("node_id").eq("topic_id", energy_topic["id"]).execute().data
-    }
-    mil_ids = {
-        r["node_id"]
-        for r in db.client().table("node_topics").select("node_id").eq("topic_id", mil_topic["id"]).execute().data
-    }
-    overlap = energy_ids & mil_ids
-    print(f"  energy topic: {energy_topic['name']} ({len(energy_ids)} nodes)")
-    print(f"  military topic: {mil_topic['name']} ({len(mil_ids)} nodes)")
-    print(f"  overlap: {len(overlap)} nodes in both")
+print("\n=== CROSS-DOMAIN CHECK: nodes under BOTH 'energy' and 'security' (DAG rollup) ===")
+# Uses nodes_under_topic (root + all descendants), so e.g. 'security' aggregates
+# 'military conflict', 'regional security', etc. — the payoff of the topic DAG.
+energy_topic = db.find_topic("energy") or db.find_topic("oil exports")
+sec_topic    = db.find_topic("security") or db.find_topic("military conflict")
+if energy_topic and sec_topic:
+    energy_ids = {n["id"] for n in db.nodes_under_topic(energy_topic["id"], 500)}
+    sec_ids    = {n["id"] for n in db.nodes_under_topic(sec_topic["id"], 500)}
+    overlap = energy_ids & sec_ids
+    print(f"  energy rollup: {energy_topic['name']} ({len(energy_ids)} nodes)")
+    print(f"  security rollup: {sec_topic['name']} ({len(sec_ids)} nodes)")
+    print(f"  overlap: {len(overlap)} nodes under both")
     if overlap:
         rows = db.client().table("nodes").select("content").in_("id", list(overlap)).execute().data
         for r in rows:

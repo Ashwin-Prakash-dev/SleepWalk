@@ -36,6 +36,9 @@ create table if not exists nodes (
 );
 -- Additive for DBs created before the batched inference engine existed.
 alter table nodes add column if not exists inference_processed boolean default false;
+-- Derivation depth: raw_input nodes are 0; a derived inference is 1 + max(premise
+-- depths). Lets the forward-chaining engine layer by epistemic depth and cap it.
+alter table nodes add column if not exists depth int default 0;
 
 create table if not exists edges (
   id         uuid primary key default gen_random_uuid(),
@@ -209,6 +212,85 @@ language sql stable as $$
   limit match_count;
 $$;
 
+-- 7b. Topic hierarchy (overlapping DAG over the flat topics) -----------------
+-- The flat `topics` rows are the leaves the LLM actually tags. This layer adds
+-- IS-A relations *above* them, so e.g. 'chip exports' -> 'semiconductors' ->
+-- 'economics'. It is a DAG, not a tree: a topic may have several parents
+-- ('chip export controls' under both 'semiconductors' and 'trade policy'), which
+-- is why parents live in an edge table rather than a parent_id column.
+--
+-- Rollups ("all economics news") are computed at READ TIME via the recursive
+-- functions below — we deliberately do NOT materialise a node->ancestor closure
+-- (same philosophy as streams: store the small, stable structure; derive the
+-- aggregate on query).
+alter table topics add column if not exists is_root boolean default false;
+
+create table if not exists topic_relations (
+  child_id   uuid references topics(id) on delete cascade,
+  parent_id  uuid references topics(id) on delete cascade,
+  created_at timestamptz default now(),
+  primary key (child_id, parent_id),
+  check (child_id <> parent_id)        -- no self-loops; cycles guarded in SQL below
+);
+
+create index if not exists topic_relations_child_idx  on topic_relations (child_id);
+create index if not exists topic_relations_parent_idx on topic_relations (parent_id);
+
+-- All topics at or below `root` (root included), walking child edges downward.
+-- The path array is a cycle guard: a child already on the path is never re-expanded.
+create or replace function topic_descendants(root uuid)
+returns table (id uuid)
+language sql stable as $$
+  with recursive d(id, path) as (
+    select root, array[root]
+    union all
+    select tr.child_id, d.path || tr.child_id
+    from topic_relations tr
+    join d on tr.parent_id = d.id
+    where not (tr.child_id = any(d.path))
+  )
+  select distinct id from d;
+$$;
+
+-- All topics at or above `start_id` (start included), walking parent edges upward.
+create or replace function topic_ancestors(start_id uuid)
+returns table (id uuid)
+language sql stable as $$
+  with recursive a(id, path) as (
+    select start_id, array[start_id]
+    union all
+    select tr.parent_id, a.path || tr.parent_id
+    from topic_relations tr
+    join a on tr.child_id = a.id
+    where not (tr.parent_id = any(a.path))
+  )
+  select distinct id from a;
+$$;
+
+-- Read-time rollup: recent raw_input nodes tagged with `root` or any descendant
+-- of it. EXISTS (not a join) so a node tagged with several descendants appears once.
+create or replace function nodes_under_topic(root uuid, match_count int default 50)
+returns table (
+  id uuid,
+  node_kind text,
+  actor text,
+  subject text,
+  confidence float,
+  content text
+)
+language sql stable as $$
+  select n.id, n.node_kind, n.actor, n.subject, n.confidence, n.content
+  from nodes n
+  where n.node_category = 'raw_input'
+    and exists (
+      select 1 from node_topics nt
+      where nt.node_id = n.id
+        and nt.topic_id in (select id from topic_descendants(root))
+    )
+  order by coalesce(n.event_date, n.created_at) desc
+  limit match_count;
+$$;
+
 -- 8. Backfill node_entities from the existing primary-actor reference --------
 -- Idempotent: safe to re-run alongside the rest of this file.
 insert into node_entities (node_id, entity_id, role)
@@ -259,4 +341,29 @@ language sql stable as $$
     and 1 - (embedding <=> query_embedding) > match_threshold
   order by embedding <=> query_embedding
   limit match_count;
+$$;
+
+-- derivation_roots: the transitive raw_input ancestors of a node, walking
+-- derives_from edges down to the leaves (a raw_input node returns just itself).
+-- This is the provenance set the independence/convergence guard compares on:
+-- two inferences only count as independent re-derivations when their RAW
+-- grounding is largely disjoint, so a conclusion derived from its own
+-- descendants can never masquerade as independent corroboration. The path array
+-- guards against cycles in the derives_from graph.
+create or replace function derivation_roots(start_id uuid)
+returns table (id uuid)
+language sql stable as $$
+  with recursive chain(id, path) as (
+    select start_id, array[start_id]
+    union all
+    select e.target_id, chain.path || e.target_id
+    from edges e
+    join chain on e.source_id = chain.id
+    where e.edge_type = 'derives_from'
+      and not (e.target_id = any(chain.path))
+  )
+  select distinct n.id
+  from chain
+  join nodes n on n.id = chain.id
+  where n.node_category = 'raw_input';
 $$;

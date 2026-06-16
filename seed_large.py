@@ -138,6 +138,7 @@ def reset() -> None:
     c.table("inference_meta").delete().neq("node_id", nil).execute()
     c.table("node_topics").delete().neq("node_id", nil).execute()
     c.table("node_entities").delete().neq("node_id", nil).execute()
+    c.table("topic_relations").delete().neq("child_id", nil).execute()
     c.table("nodes").delete().neq("id", nil).execute()
     c.table("entities").delete().neq("id", nil).execute()
     c.table("topics").delete().neq("id", nil).execute()

@@ -140,6 +140,7 @@ def insert_node(
     source_url: Optional[str] = None,
     event_date: Optional[str] = None,
     expires_at: Optional[str] = None,
+    depth: int = 0,
     embedding: Optional[Embedding] = None,
 ) -> dict[str, Any]:
     if node_category not in NODE_CATEGORIES:
@@ -152,6 +153,7 @@ def insert_node(
         "node_kind": node_kind,
         "content": content,
         "confidence": confidence,
+        "depth": depth,
     }
     optional = {
         "actor": actor,
@@ -254,6 +256,67 @@ def match_topics(
 def insert_node_topic(node_id: str, topic_id: str) -> dict[str, Any]:
     payload: dict[str, Any] = {"node_id": node_id, "topic_id": topic_id}
     return _first(client().table("node_topics").upsert(payload).execute())
+
+
+# --- topic hierarchy (overlapping DAG over the flat topics) ------------------
+def insert_topic_relation(child_id: str, parent_id: str) -> None:
+    """Record a child IS-A parent edge in the topic DAG (idempotent)."""
+    if child_id == parent_id:
+        return
+    client().table("topic_relations").upsert(
+        {"child_id": child_id, "parent_id": parent_id}
+    ).execute()
+
+
+def topic_parents(topic_id: str) -> list[str]:
+    """Direct parent topic ids of `topic_id`."""
+    rows = (
+        client().table("topic_relations").select("parent_id")
+        .eq("child_id", topic_id).execute().data or []
+    )
+    return [r["parent_id"] for r in rows]
+
+
+def topic_children(topic_id: str) -> list[str]:
+    """Direct child topic ids of `topic_id`."""
+    rows = (
+        client().table("topic_relations").select("child_id")
+        .eq("parent_id", topic_id).execute().data or []
+    )
+    return [r["child_id"] for r in rows]
+
+
+def topic_descendant_ids(root: str) -> list[str]:
+    """All topic ids at or below `root` (root included), via the recursive RPC."""
+    resp = client().rpc("topic_descendants", {"root": root}).execute()
+    return [r["id"] for r in (resp.data or [])]
+
+
+def topic_ancestor_ids(start_id: str) -> list[str]:
+    """All topic ids at or above `start_id` (start included), via the recursive RPC."""
+    resp = client().rpc("topic_ancestors", {"start_id": start_id}).execute()
+    return [r["id"] for r in (resp.data or [])]
+
+
+def set_topic_root(topic_id: str, is_root: bool = True) -> None:
+    """Mark (or unmark) a topic as a curated top-level domain."""
+    client().table("topics").update({"is_root": is_root}).eq("id", topic_id).execute()
+
+
+def list_root_topics() -> list[dict[str, Any]]:
+    """Curated top-level domain topics (is_root = true)."""
+    return (
+        client().table("topics").select("id,name,aliases")
+        .eq("is_root", True).order("name").execute().data or []
+    )
+
+
+def nodes_under_topic(root: str, match_count: int = 50) -> list[dict[str, Any]]:
+    """Read-time rollup: recent raw_input nodes tagged with `root` or any descendant."""
+    resp = client().rpc(
+        "nodes_under_topic", {"root": root, "match_count": match_count}
+    ).execute()
+    return resp.data or []
 
 
 def nodes_by_entity(entity_id: str, exclude_id: str, limit: int = 10) -> list[dict[str, Any]]:
@@ -370,7 +433,7 @@ def stream_between_names(
 # which sidesteps parsing the pgvector wire format back into a list).
 INFERENCE_NODE_COLUMNS = (
     "id,node_category,node_kind,actor,subject,confidence,content,"
-    "source_url,event_date,created_at"
+    "source_url,event_date,created_at,depth"
 )
 
 
@@ -487,6 +550,34 @@ def derives_from_targets(inference_id: str) -> list[str]:
         .data or []
     )
     return [e["target_id"] for e in edges]
+
+
+def derivation_roots(node_id: str) -> list[str]:
+    """Transitive raw_input ancestors of a node (just itself, if it is raw_input).
+
+    Walks derives_from edges down to the leaves via the recursive RPC. This is the
+    grounding set the independence/convergence guard compares on.
+    """
+    resp = client().rpc("derivation_roots", {"start_id": node_id}).execute()
+    return [r["id"] for r in (resp.data or [])]
+
+
+def inference_statuses(ids: Sequence[str]) -> dict[str, str]:
+    """Map inference node_id -> verification status for the given ids.
+
+    Used to gate which inferences may serve as premises (only 'corroborated' ones).
+    """
+    if not ids:
+        return {}
+    rows = (
+        client()
+        .table("inference_meta")
+        .select("node_id,status")
+        .in_("node_id", list(ids))
+        .execute()
+        .data or []
+    )
+    return {r["node_id"]: r["status"] for r in rows}
 
 
 def match_inferences(

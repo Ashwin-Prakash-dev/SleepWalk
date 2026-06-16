@@ -249,6 +249,51 @@ def resolve_entity_coreference(
     return None
 
 
+TOPIC_PARENT_SYSTEM_PROMPT = (
+    "You organize topics into a hierarchy of broader domains. Given a narrow topic, "
+    "name the single broader domain it is a kind of (an IS-A parent). Always respond "
+    'with valid JSON only: {"parent": <string> | null}.'
+)
+
+TOPIC_PARENT_USER_PROMPT = """Narrow topic: "{topic}"
+
+Existing broader domains (prefer one of these if it genuinely fits):
+{domains}
+
+Name the single broader domain that "{topic}" is a kind of — strictly MORE GENERAL than the topic itself (2-4 words). Examples: "chip exports" -> "semiconductors"; "semiconductors" -> "technology"; "naval deployment" -> "military"; "oil exports" -> "energy".
+
+Rules:
+- The parent must be broader than the topic, never a synonym or a rephrasing of it.
+- If one of the existing domains above fits, return that exact string.
+- If "{topic}" is already a broad top-level domain (e.g. "economics", "energy", "security"), return null.
+
+Return JSON only: {{"parent": <string> | null}}"""
+
+
+def classify_topic_parent(topic: str, existing_domains: list[str]) -> Optional[str]:
+    """Return the broader domain `topic` is a kind of, or None if it's top-level.
+
+    `existing_domains` (current root / high-level topic names) is offered to the
+    model to bias convergence onto a shared vocabulary rather than inventing
+    near-duplicate parents. Biased to Gemini to spare the scarce Groq token budget.
+    """
+    domains = "\n".join(f"- {d}" for d in existing_domains) or "(none yet)"
+    prompt = TOPIC_PARENT_USER_PROMPT.format(topic=topic, domains=domains)
+    try:
+        result = _complete_json(
+            TOPIC_PARENT_SYSTEM_PROMPT, prompt, max_tokens=60, prefer="gemini"
+        )
+    except ValueError:
+        return None
+    if isinstance(result, dict):
+        parent = result.get("parent")
+        if isinstance(parent, str):
+            parent = parent.strip()
+            if parent and parent.lower() != topic.strip().lower():
+                return parent
+    return None
+
+
 def _format_similar_nodes(nodes: list[dict]) -> str:
     """Render stored nodes as an indexed list the model can reference by index."""
     if not nodes:
@@ -337,22 +382,24 @@ REASON_PAIR_SYSTEM_PROMPT = (
     "JSON only. No preamble, no markdown."
 )
 
-REASON_PAIR_USER_PROMPT = """Two events have been observed. State the single strongest NEW logical inference that follows from COMBINING them — a conclusion neither event states on its own (a + b => c). It need NOT be a contradiction or agreement; it can be any causal link, implication, or consequence.
+REASON_PAIR_USER_PROMPT = """Two premises have been observed. State the single strongest NEW logical inference that follows from COMBINING them — a conclusion neither premise states on its own (a + b => c). It need NOT be a contradiction or agreement; it can be any causal link, implication, or consequence.
 
-EVENT A:
+A premise tagged "derived inference" is a PRIOR CONCLUSION, not a direct observation: treat it as provisional, and let your confidence reflect that the chain is only as strong as its weakest link.
+
+PREMISE A ({a_origin}):
 actor={a_actor} | kind={a_kind} | subject={a_subject}
 {a_content}
 
-EVENT B:
+PREMISE B ({b_origin}):
 actor={b_actor} | kind={b_kind} | subject={b_subject}
 {b_content}
 
 Return a JSON object:
 - content: string (one clear sentence stating the inferred conclusion), or null if no meaningful new inference follows
-- confidence: float 0.0 to 1.0 (how strongly the two events jointly support this conclusion)
+- confidence: float 0.0 to 1.0 (how strongly the two premises jointly support this conclusion)
 - reasoning: string (one sentence explaining the logical step)
 
-If the events are unrelated, or one merely restates the other, return {{"content": null}}."""
+If the premises are unrelated, or one merely restates the other, return {{"content": null}}."""
 
 
 ALTERNATIVES_SYSTEM_PROMPT = (
@@ -407,17 +454,30 @@ def _format_alternatives(alternatives: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _origin_label(node: dict) -> str:
+    """Provenance tag for a premise: an observation vs a prior (derived) conclusion."""
+    if node.get("node_category") == "inference":
+        try:
+            conf = float(node.get("confidence"))
+        except (TypeError, ValueError):
+            conf = 0.0
+        return f"derived inference, prior conclusion at confidence {conf:.2f}"
+    return "observed report"
+
+
 def reason_pair(node_a: dict, node_b: dict) -> dict:
-    """Pass 1: open-ended logical inference combining two events (a + b => c).
+    """Pass 1: open-ended logical inference combining two premises (a + b => c).
 
     Returns {content, confidence, reasoning}, or {} if no meaningful inference
     follows. Biased to the Gemini backend to spare the scarce Groq token budget.
     """
     prompt = REASON_PAIR_USER_PROMPT.format(
+        a_origin=_origin_label(node_a),
         a_actor=node_a.get("actor") or "unknown",
         a_kind=node_a.get("node_kind") or "unknown",
         a_subject=node_a.get("subject") or "unknown",
         a_content=node_a.get("content", ""),
+        b_origin=_origin_label(node_b),
         b_actor=node_b.get("actor") or "unknown",
         b_kind=node_b.get("node_kind") or "unknown",
         b_subject=node_b.get("subject") or "unknown",

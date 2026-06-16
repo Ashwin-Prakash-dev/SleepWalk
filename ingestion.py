@@ -25,6 +25,7 @@ import db
 from embeddings import embed
 from llm_service import (
     classify_evidence,
+    classify_topic_parent,
     enumerate_alternatives,
     extract_node,
     reason_pair,
@@ -58,6 +59,10 @@ ENTITY_CANDIDATE_K = 5
 # merge; "energy" / "military conflict" should not).
 TOPIC_MATCH_THRESHOLD = 0.82
 
+# Max levels to climb when placing a brand-new topic into the hierarchy. Bounds
+# the LLM calls spent per never-before-seen topic and backstops runaway chains.
+TOPIC_HIERARCHY_MAX_DEPTH = 4
+
 # --- batched, adversarially-verified inference knobs -------------------------
 # All tunable; defaults are conservative because every stage is multi-LLM-call
 # and the free Groq tier caps daily tokens (Gemini failover absorbs overflow).
@@ -79,6 +84,12 @@ CORROBORATION_BONUS         = 0.25  # max additive bonus, scaled by coverage * m
 CONVERGENCE_THRESHOLD       = 0.82  # cosine for "the same inference" (calibrated for MiniLM scale)
 CONVERGENCE_BONUS           = 0.15  # additive per independent re-derivation (still coverage-gated)
 INDEPENDENCE_MAX_OVERLAP    = 0.34  # source-set Jaccard above which a rederivation is NOT independent
+
+# --- forward-chaining (derived nodes as premises) ----------------------------
+# Phase 1: a corroborated inference may itself become a PREMISE for new reasoning,
+# enabling multi-hop derivation. Guarded hard — see [[inference-forward-chaining-design]].
+PROMOTE_THRESHOLD       = 0.7   # min confidence + 'corroborated' status to be reusable as a premise
+MAX_DERIVATION_DEPTH    = 2     # cap on derived-node depth (raw=0); Phase 2 raises this
 
 # Module-level embedding cache, keyed by node id (content embeddings are stable).
 _emb_cache: dict[str, list[float]] = {}
@@ -171,10 +182,14 @@ def _edge_exists(a: str, b: str, edge_type: str) -> bool:
     return bool(res.data)
 
 
-def _resolve_topic(name: str) -> str:
-    """Return the topic id for `name`, creating the topic if needed.
+def _resolve_topic(name: str, depth: int = 0) -> str:
+    """Return the topic id for `name`, creating + placing it in the DAG if needed.
 
     Mirrors _resolve_entity: exact/alias match → embedding similarity → create.
+    A *newly created* topic is then attached to the hierarchy (climbed toward a
+    root); matched/existing topics are assumed already placed, so no LLM cost is
+    paid on the hot ingest path for topics we've seen before. `depth` bounds the
+    upward climb when this call is itself resolving a parent.
     """
     safe = _pg_quote(name)
     res = (
@@ -195,7 +210,53 @@ def _resolve_topic(name: str) -> str:
         db.add_topic_alias(topic_id, name)
         return topic_id
 
-    return db.insert_topic(name=name, aliases=[name], embedding=topic_embedding)["id"]
+    topic_id = db.insert_topic(name=name, aliases=[name], embedding=topic_embedding)["id"]
+    _attach_to_hierarchy(topic_id, name, depth)
+    return topic_id
+
+
+def _attach_to_hierarchy(topic_id: str, name: str, depth: int = 0) -> None:
+    """Place a freshly-created topic under a broader parent, climbing toward a root.
+
+    Asks the LLM for the broader domain `name` is a kind of (biased to existing
+    roots for vocabulary convergence), resolves that parent through _resolve_topic
+    — which may itself create and further climb it — and records a child→parent edge.
+
+    Guards: a depth cap bounds the climb; a topic the LLM judges top-level is
+    marked is_root and stops; and the edge is skipped if the proposed parent is
+    already a descendant of this topic (which would close a cycle).
+    """
+    if depth >= TOPIC_HIERARCHY_MAX_DEPTH:
+        return
+    roots = [r["name"] for r in db.list_root_topics()]
+    parent_name = classify_topic_parent(name, roots)
+    if not parent_name:
+        db.set_topic_root(topic_id)            # already a top-level domain
+        return
+
+    parent_id = _resolve_topic(parent_name, depth + 1)
+    if parent_id == topic_id:
+        db.set_topic_root(topic_id)
+        return
+    if parent_id in db.topic_descendant_ids(topic_id):
+        return                                 # would close a cycle; leave unlinked
+    db.insert_topic_relation(child_id=topic_id, parent_id=parent_id)
+
+
+def backfill_topic_hierarchy() -> dict:
+    """Place existing topics that predate the hierarchy (no parents, not a root).
+
+    One-shot maintenance for corpora seeded before topic_relations existed; safe
+    to re-run (already-placed topics are skipped).
+    """
+    topics = db.client().table("topics").select("id,name,is_root").execute().data or []
+    placed = 0
+    for t in topics:
+        if t.get("is_root") or db.topic_parents(t["id"]):
+            continue
+        _attach_to_hierarchy(t["id"], t["name"], 0)
+        placed += 1
+    return {"examined": len(topics), "placed": placed}
 
 
 def _link_topics(node_id: str, domains: Optional[list]) -> None:
@@ -330,6 +391,7 @@ def run_inference_batch(force: bool = False) -> dict:
         if not inf or not inf.get("content"):
             continue
         base_conf = _to_float(inf.get("confidence"), 0.6)
+        base_conf = _propagate_confidence(base_conf, node_a, node_b)
         verdict = _verify_inference(inf, node_a, node_b, base_conf)
         _persist_inference(inf, node_a, node_b, base_conf, verdict)
         created += 1
@@ -396,6 +458,97 @@ def _topic_ids(node_id: str) -> list[str]:
     return [r["topic_id"] for r in rows]
 
 
+def _node_depth(node: dict) -> int:
+    """Derivation depth of a node (raw_input = 0); tolerates a missing column."""
+    try:
+        return int(node.get("depth") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_valid_premise(partner: dict, node_a: dict, statuses: dict[str, str]) -> bool:
+    """Whether `partner` may pair with `node_a` as a premise.
+
+    raw_input partners are always eligible (subject to the same-source guard). An
+    inference partner is eligible only if it is a verified, high-confidence,
+    not-too-deep prior conclusion — see [[inference-forward-chaining-design]].
+    Verification (Pass 2) stays raw-only, so derived nodes feed reasoning as
+    premises but never count as corroborating evidence.
+    """
+    if partner.get("source_url") and partner["source_url"] == node_a.get("source_url"):
+        return False  # same article => not independent
+    category = partner.get("node_category")
+    if category == "raw_input":
+        return True
+    if category == "inference":
+        if statuses.get(partner["id"]) != "corroborated":
+            return False
+        if _to_float(partner.get("confidence"), 0.0) < PROMOTE_THRESHOLD:
+            return False
+        # A premise at depth d yields a conclusion at depth d+1; keep it <= cap.
+        return _node_depth(partner) < MAX_DERIVATION_DEPTH
+    return False
+
+
+def _propagate_confidence(base_conf: float, node_a: dict, node_b: dict) -> float:
+    """Cap a conclusion's confidence by its weakest DERIVED premise (min-chain).
+
+    Chaining can't manufacture certainty: a conclusion built on a prior inference
+    is no more confident than that inference. raw_input premises don't cap here —
+    their credibility is already handled by the coverage/verification machinery.
+    """
+    derived = [
+        _to_float(n.get("confidence"), 1.0)
+        for n in (node_a, node_b)
+        if n.get("node_category") == "inference"
+    ]
+    return min([base_conf, *derived]) if derived else base_conf
+
+
+def _derivation_roots(node_a: dict, node_b: dict) -> list[str]:
+    """Transitive raw_input grounding of a pair: each raw premise contributes
+    itself, each derived premise contributes its own raw ancestors."""
+    roots: set[str] = set()
+    for n in (node_a, node_b):
+        if n.get("node_category") == "inference":
+            roots.update(db.derivation_roots(n["id"]))
+        else:
+            roots.add(n["id"])
+    return list(roots)
+
+
+def _independence_capped_confidence(
+    conf: float, verdict: dict, node_a: dict, node_b: dict, convergent: list[str]
+) -> float:
+    """Enforce min-chain monotonicity, with an independence exception.
+
+    A derived conclusion may exceed its weakest DERIVED premise only when the lift
+    is earned by evidence INDEPENDENT of that premise's own grounding: raw support
+    that isn't already an ancestor of the premise, or a convergent inference whose
+    roots barely overlap the premise's. Absent that, the confidence is hard-capped
+    at the weakest derived premise — chaining alone can't manufacture certainty.
+    """
+    derived = [n for n in (node_a, node_b) if n.get("node_category") == "inference"]
+    if not derived:
+        return conf  # no chain => leave the existing machinery untouched
+    premise_cap = min(_to_float(n.get("confidence"), 1.0) for n in derived)
+    if conf <= premise_cap:
+        return conf
+
+    premise_roots: set[str] = set()
+    for n in derived:
+        premise_roots.update(db.derivation_roots(n["id"]))
+
+    independent_support = any(s not in premise_roots for s in verdict["support_ids"])
+    independent_conv = any(
+        _jaccard(set(db.derivation_roots(cid)), premise_roots) <= INDEPENDENCE_MAX_OVERLAP
+        for cid in convergent
+    )
+    if independent_support or independent_conv:
+        return conf  # the lift is genuinely backed by independent evidence
+    return min(conf, premise_cap)
+
+
 # --- Pass 1: candidate pairing ----------------------------------------------
 def _candidate_pairs(new_nodes: list[dict]) -> list[tuple[dict, dict, float]]:
     """Pair each new node with its best non-duplicate partners across the graph.
@@ -421,12 +574,14 @@ def _candidate_pairs(new_nodes: list[dict]) -> list[tuple[dict, dict, float]]:
         if not cand_ids:
             continue
 
+        partners = db.nodes_by_ids(cand_ids)
+        inf_ids = [p["id"] for p in partners if p.get("node_category") == "inference"]
+        statuses = db.inference_statuses(inf_ids) if inf_ids else {}
+
         scored: list[tuple[float, dict]] = []
-        for partner in db.nodes_by_ids(cand_ids):
-            if partner.get("node_category") != "raw_input":
+        for partner in partners:
+            if not _is_valid_premise(partner, node_a, statuses):
                 continue
-            if partner.get("source_url") and partner["source_url"] == node_a.get("source_url"):
-                continue  # same article => not independent evidence
             sim = _cosine(a_emb, _node_embedding(partner))
             if sim < MIN_PAIR_SIMILARITY or sim >= DUPLICATE_THRESHOLD:
                 continue
@@ -589,20 +744,21 @@ def _jaccard(a: set, b: set) -> float:
     return len(a & b) / len(a | b)
 
 
-def _detect_convergence(inf_embedding: list[float], source_ids: list[str]) -> list[str]:
+def _detect_convergence(inf_embedding: list[float], source_roots: list[str]) -> list[str]:
     """Existing inferences that independently re-derive this one.
 
-    A match counts only if its source-node set is largely DISJOINT from this
-    inference's sources (Jaccard <= INDEPENDENCE_MAX_OVERLAP) — same-evidence
-    rederivation is not corroboration.
+    Independence is judged on transitive RAW grounding (derivation_roots), not the
+    direct premises: a match counts only if its raw-ancestor set is largely DISJOINT
+    from this inference's (Jaccard <= INDEPENDENCE_MAX_OVERLAP). This is what stops a
+    conclusion re-derived from its own descendants from posing as corroboration.
     """
     convergent: list[str] = []
-    src = set(source_ids)
+    src = set(source_roots)
     for m in db.match_inferences(inf_embedding, CONVERGENCE_THRESHOLD, 10):
-        existing_sources = set(db.derives_from_targets(m["id"]))
-        if not existing_sources:
+        existing_roots = set(db.derivation_roots(m["id"]))
+        if not existing_roots:
             continue
-        if _jaccard(src, existing_sources) <= INDEPENDENCE_MAX_OVERLAP:
+        if _jaccard(src, existing_roots) <= INDEPENDENCE_MAX_OVERLAP:
             convergent.append(m["id"])
     return convergent
 
@@ -613,10 +769,12 @@ def _persist_inference(
     """Insert the inference node + meta + verification/convergence edges."""
     content = inference["content"]
     emb = embed(content)
-    source_ids = [node_a["id"], node_b["id"]]
+    # Independence is judged on transitive raw grounding, so a derived premise
+    # contributes its own raw ancestors rather than itself.
+    source_roots = _derivation_roots(node_a, node_b)
 
     # Detect convergence BEFORE insert so we don't match the row against itself.
-    convergent = _detect_convergence(emb, source_ids)
+    convergent = _detect_convergence(emb, source_roots)
     conf = verdict["confidence"]
     if convergent:
         conf = min(
@@ -624,6 +782,11 @@ def _persist_inference(
             conf + CONVERGENCE_BONUS * len(convergent),
         )
 
+    # Min-chain monotonicity (with independence exception): a derived conclusion
+    # can't out-confidence its premises on the strength of shared evidence alone.
+    conf = _independence_capped_confidence(conf, verdict, node_a, node_b, convergent)
+
+    depth = 1 + max(_node_depth(node_a), _node_depth(node_b))
     inf_row = db.insert_node(
         node_category="inference",
         node_kind="derived",          # verdict lives in inference_meta.status, not node_kind
@@ -631,6 +794,7 @@ def _persist_inference(
         actor=node_a.get("actor"),
         subject=node_a.get("subject"),
         confidence=conf,
+        depth=depth,
         embedding=emb,
     )
     inf_id = inf_row["id"]
@@ -701,9 +865,12 @@ if __name__ == "__main__":
 
     if len(sys.argv) < 2:
         print('usage: python ingestion.py "<text to ingest>"')
-        print("       python ingestion.py --infer   # flush the inference batch")
+        print("       python ingestion.py --infer    # flush the inference batch")
+        print("       python ingestion.py --topics   # place pre-existing topics in the DAG")
         raise SystemExit(1)
     if sys.argv[1] == "--infer":
         print(run_inference_batch(force=True))
+    elif sys.argv[1] == "--topics":
+        print(backfill_topic_hierarchy())
     else:
         print(ingest_text(sys.argv[1]))
