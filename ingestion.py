@@ -99,6 +99,29 @@ MAX_PAIRS_PER_LEVEL     = 15    # pairs reasoned per deepening pass
 DEEPEN_GLOBAL_PAIR_CAP  = 45    # hard cap on pairs across all passes of one batch
 MAX_DEEPEN_PASSES       = 4     # belt-and-suspenders cap on pass count
 
+# Redundancy control (flag-gated). When on, a freshly-reasoned conclusion that is a
+# near-duplicate (cosine >= MERGE_THRESHOLD) of an existing inference AND rests on
+# overlapping raw grounding (Jaccard > INDEPENDENCE_MAX_OVERLAP — i.e. NOT an
+# independent re-derivation) is dropped before verification, so deepening spends its
+# budget on novel conclusions instead of rephrasings. Independent re-derivations
+# still pass through and earn convergence. See [[inference-forward-chaining-design]].
+DEDUP_INFERENCES = os.environ.get("ENCELADUS_DEDUP_INFERENCES", "0") == "1"
+MERGE_THRESHOLD  = 0.93         # "the same conclusion restated" (> CONVERGENCE_THRESHOLD)
+
+# --- verification experiments (flag-gated; baseline = all defaults) ----------
+# Every flag here defaults to the original behavior so the baseline stays exactly
+# reproducible; eval/run_eval.py flips them to measure each change against labels.
+# Local models only — see rerank.py / nli.py (lazy-loaded, cached, no API cost).
+#
+# Phase 1: cross-encoder reranking of the evidence pool before the classify cap.
+RERANK_EVIDENCE      = os.environ.get("ENCELADUS_RERANK_EVIDENCE", "0") == "1"
+EVIDENCE_RERANK_POOL = 40      # wider pre-rerank pool; post-rerank still EVIDENCE_CLASSIFY_CAP
+#
+# Phase 2: evidence classifier path — "llm" (current), "nli", or "both" (agree-or-abstain).
+USE_NLI_CLASSIFIER   = os.environ.get("ENCELADUS_NLI_CLASSIFIER", "llm")
+NLI_ENTAIL_THRESHOLD = 0.6     # P(entailment) >= this => supports_inference
+NLI_CONTRA_THRESHOLD = 0.6     # P(contradiction) >= this => supports_alternative (defeater)
+
 # Module-level embedding cache, keyed by node id (content embeddings are stable).
 _emb_cache: dict[str, list[float]] = {}
 
@@ -304,8 +327,12 @@ def _link_entities(
 
 
 # --- pipeline ----------------------------------------------------------------
-def ingest_text(text: str, source_url: str = None) -> str:
+def ingest_text(text: str, source_url: str = None, event_date: str = None) -> str:
     """Run the full ingestion pipeline on one piece of text.
+
+    `event_date` (ISO string, optional) records when the event actually occurred —
+    e.g. a news article's publishedAt — so coverage / time-window / convergence
+    reason over real dates instead of ingestion time. Defaults to None (unchanged).
 
     Returns the id of the inserted raw-input node.
     """
@@ -336,6 +363,7 @@ def ingest_text(text: str, source_url: str = None) -> str:
         subject=subject,
         confidence=_to_float(node.get("confidence"), 0.8),
         source_url=source_url,
+        event_date=event_date,
         expires_at=node.get("expires_at"),
         embedding=embedding,
     )
@@ -392,6 +420,10 @@ def run_inference_batch(force: bool = False) -> dict:
     if count == 0 or (count < INFERENCE_BATCH_SIZE and not force):
         return {"pairs": 0, "inferences": 0, "processed": 0, "skipped": count}
 
+    # TODO(out-of-scope): temporal re-opening — when new raw_input arrives in the
+    # time window of an existing 'corroborated'/'unverified' verdict, re-run its
+    # verification so stale conclusions can be contested by later evidence. Would
+    # hook in here, selecting affected prior inferences before processing new nodes.
     new_nodes = db.fetch_unprocessed_nodes(limit=200)
     raw_ids = [n["id"] for n in new_nodes]
 
@@ -400,7 +432,7 @@ def run_inference_batch(force: bool = False) -> dict:
     # fixpoint (nothing promotable), the depth cap, or the global pair budget.
     frontier = new_nodes
     seen_ids = set(raw_ids)
-    total_pairs = total_created = passes = 0
+    total_pairs = total_created = deduped = passes = 0
     budget = DEEPEN_GLOBAL_PAIR_CAP
 
     while frontier and budget > 0 and passes < MAX_DEEPEN_PASSES:
@@ -413,6 +445,12 @@ def run_inference_batch(force: bool = False) -> dict:
         for node_a, node_b, _sim in pairs:
             inf = reason_pair(node_a, node_b)
             if not inf or not inf.get("content"):
+                continue
+            # Drop redundant restatements BEFORE the costly verification step.
+            if DEDUP_INFERENCES and _find_duplicate(
+                embed(inf["content"]), _derivation_roots(node_a, node_b)
+            ):
+                deduped += 1
                 continue
             base_conf = _propagate_confidence(_to_float(inf.get("confidence"), 0.6), node_a, node_b)
             verdict = _verify_inference(inf, node_a, node_b, base_conf)
@@ -434,6 +472,7 @@ def run_inference_batch(force: bool = False) -> dict:
     return {
         "pairs": total_pairs,
         "inferences": total_created,
+        "deduped": deduped,
         "processed": len(raw_ids),
         "passes": passes,
     }
@@ -637,13 +676,16 @@ def _candidate_pairs(new_nodes: list[dict]) -> list[tuple[dict, dict, float]]:
 
 # --- Pass 2: adversarial verification ---------------------------------------
 def _hybrid_retrieve(
-    alternatives: list[dict], node_a: dict, node_b: dict
+    alternatives: list[dict], node_a: dict, node_b: dict, inference_content: str = ""
 ) -> list[dict]:
     """Evidence pool: cosine over each alternative's evidence_signature UNION a
     structural pull (actor / entities / edges / time window) around the sources.
 
     Ordered by channel priority (signature-semantic first, time-window last),
     deduped preserving order, raw_input only, capped for the classifier prompt.
+
+    When RERANK_EVIDENCE is on, a wider pool (EVIDENCE_RERANK_POOL) is reordered by
+    a cross-encoder against `inference_content` before truncating to the same cap.
     """
     ordered_ids: list[str] = []
     seen: set[str] = {node_a["id"], node_b["id"]}
@@ -678,6 +720,14 @@ def _hybrid_retrieve(
         rows[i] for i in ordered_ids
         if i in rows and rows[i].get("node_category") == "raw_input"
     ]
+
+    if RERANK_EVIDENCE and inference_content and evidence:
+        import rerank  # local import: only loaded when reranking is enabled
+        pool = evidence[:EVIDENCE_RERANK_POOL]  # rerank a wider pool, keep the same cap
+        scores = rerank.score(inference_content, [e["content"] for e in pool])
+        pool = [e for _, e in sorted(zip(scores, pool), key=lambda t: t[0], reverse=True)]
+        return pool[:EVIDENCE_CLASSIFY_CAP]
+
     return evidence[:EVIDENCE_CLASSIFY_CAP]
 
 
@@ -708,6 +758,59 @@ def _coverage_ceiling(coverage: float) -> float:
     return 0.40 + 0.55 * coverage
 
 
+def _classify_evidence_nli(inference_content: str, retrieved: list[dict]) -> list[dict]:
+    """NLI path: label each retrieved node by entailment against the inference.
+
+    entailment >= NLI_ENTAIL_THRESHOLD => supports_inference; contradiction >=
+    NLI_CONTRA_THRESHOLD => supports_alternative (a defeater); else irrelevant.
+    The defeater's alternative_index is left None — NLI judges the inference
+    directly, not which competing alternative a node supports; a non-empty defeater
+    set already drives the verdict to 'contested'.
+    """
+    import nli  # local import: only loaded when the NLI path is selected
+    out: list[dict] = []
+    for i, node in enumerate(retrieved):
+        scores = nli.entail_scores(node.get("content", ""), inference_content)
+        if scores["entailment"] >= NLI_ENTAIL_THRESHOLD:
+            out.append({"index": i, "label": "supports_inference"})
+        elif scores["contradiction"] >= NLI_CONTRA_THRESHOLD:
+            out.append({"index": i, "label": "supports_alternative", "alternative_index": None})
+        else:
+            out.append({"index": i, "label": "irrelevant"})
+    return out
+
+
+def _classify_evidence(
+    inference_content: str, alternatives: list[dict], retrieved: list[dict]
+) -> list[dict]:
+    """Select the evidence-classification path per USE_NLI_CLASSIFIER.
+
+    "llm"  -> the existing LLM classifier (default, baseline; failover untouched).
+    "nli"  -> local entailment model only.
+    "both" -> label only where LLM and NLI agree; disagreement abstains to
+              'irrelevant', which surfaces downstream as more 'unverified'.
+    """
+    mode = USE_NLI_CLASSIFIER
+    if mode == "nli":
+        return _classify_evidence_nli(inference_content, retrieved)
+    if mode == "both":
+        llm = {
+            c.get("index"): c
+            for c in classify_evidence(inference_content, alternatives, retrieved)
+            if isinstance(c.get("index"), int)
+        }
+        nli_labels = {c["index"]: c for c in _classify_evidence_nli(inference_content, retrieved)}
+        out: list[dict] = []
+        for i in range(len(retrieved)):
+            lc, nc = llm.get(i), nli_labels.get(i)
+            if lc and nc and lc.get("label") == nc.get("label"):
+                out.append(lc)  # agreement: keep the LLM record (carries alternative_index)
+            else:
+                out.append({"index": i, "label": "irrelevant"})  # abstain on disagreement
+        return out
+    return classify_evidence(inference_content, alternatives, retrieved)  # "llm" / default
+
+
 def _verify_inference(
     inference: dict, node_a: dict, node_b: dict, base_conf: float
 ) -> dict:
@@ -716,9 +819,12 @@ def _verify_inference(
     Returns the verdict dict consumed by _persist_inference.
     """
     content = inference["content"]
+    # TODO(out-of-scope): corpus-grounded reportability — estimate each alternative's
+    # reportability from how often such events actually surface in the corpus,
+    # rather than the LLM's prior. Hooks in here on `alternatives`.
     alternatives = enumerate_alternatives(content, MAX_ALTERNATIVES)[:MAX_ALTERNATIVES]
-    retrieved = _hybrid_retrieve(alternatives, node_a, node_b)
-    classifications = classify_evidence(content, alternatives, retrieved)
+    retrieved = _hybrid_retrieve(alternatives, node_a, node_b, content)
+    classifications = _classify_evidence(content, alternatives, retrieved)
 
     support_ids: list[str] = []
     defeater_ids: list[str] = []
@@ -747,6 +853,10 @@ def _verify_inference(
         if i not in alt_supported and _to_float(a.get("reportability"), 0.0) >= HIGH_REPORTABILITY
     ]
 
+    # TODO(out-of-scope): replace this hand-tuned status/confidence arithmetic with a
+    # learned, calibrated model once a labeled set exists (features: support/defeater
+    # counts, coverage, reportability, rerank/NLI scores). Keep this branch as the
+    # baseline fallback.
     if defeater_ids:
         status = "contested"
         conf = base_conf * DEFEATER_PENALTY
@@ -780,6 +890,22 @@ def _jaccard(a: set, b: set) -> float:
     if not a or not b:
         return 0.0
     return len(a & b) / len(a | b)
+
+
+def _find_duplicate(inf_embedding: list[float], source_roots: list[str]) -> Optional[str]:
+    """An existing inference this one merely RESTATES from overlapping grounding.
+
+    Near-identical content (cosine >= MERGE_THRESHOLD) whose raw grounding overlaps
+    this one's (Jaccard > INDEPENDENCE_MAX_OVERLAP) — i.e. redundant, not independent.
+    Returns its id, or None. Independent re-derivations are deliberately NOT treated
+    as duplicates: those are corroboration, handled by _detect_convergence.
+    """
+    src = set(source_roots)
+    for m in db.match_inferences(inf_embedding, MERGE_THRESHOLD, 5):
+        existing_roots = set(db.derivation_roots(m["id"]))
+        if existing_roots and _jaccard(src, existing_roots) > INDEPENDENCE_MAX_OVERLAP:
+            return m["id"]
+    return None
 
 
 def _detect_convergence(inf_embedding: list[float], source_roots: list[str]) -> list[str]:

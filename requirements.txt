@@ -1,6 +1,8 @@
 supabase>=2.4.0
 python-dotenv>=1.0.0
-sentence-transformers>=2.6.0  # local embeddings (all-MiniLM-L6-v2, padded to 1536)
+sentence-transformers>=2.6.0  # local embeddings + CrossEncoder rerank.py/nli.py (no API cost)
+sentencepiece>=0.1.99   # tokenizer for the NLI cross-encoder (nli-deberta-v3-base); flag-gated
+protobuf>=3.20.0        # required by the DeBERTa-v3 tokenizer conversion
 groq>=0.11.0            # llm_service.py primary backend (llama-3.3-70b-versatile)
 google-genai>=0.3.0     # llm_service.py failover backend (gemini-2.0-flash)
 requests>=2.31.0        # NewsAPI ingestion

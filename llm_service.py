@@ -522,3 +522,46 @@ def classify_evidence(
     except ValueError:
         return []
     return _as_list(result, "classifications", "results", "data")
+
+
+# --- labeling aid (NOT part of the pipeline) ---------------------------------
+JUDGE_SYSTEM_PROMPT = (
+    "You are an independent fact-checking analyst. Judge whether a proposed "
+    "conclusion is correct, given its premises and your own knowledge. You are NOT "
+    "evaluating any system's verdict — only the conclusion itself. Always respond "
+    "with valid JSON only. No preamble, no markdown."
+)
+
+JUDGE_USER_PROMPT = """A conclusion was inferred from the premises below.
+
+PREMISES:
+{premises}
+
+CONCLUSION:
+"{conclusion}"
+
+Judge the CONCLUSION independently:
+- "true": well-supported — it follows from the premises and/or matches what you know to be the case.
+- "false": wrong, contradicted, or an unwarranted leap from the premises.
+- "unverifiable": not enough information to judge it either way.
+
+Return JSON only: {{"verdict": "true" | "false" | "unverifiable", "reason": "<one sentence>"}}"""
+
+
+def judge_inference(conclusion: str, premises: list[str]) -> dict:
+    """Independent true/false/unverifiable judgment of a conclusion given its premises.
+
+    A labeling AID only (used by eval/label_dump.py --llm-judge) — uses the same
+    failover router, and is NEVER a substitute for a human label. Returns
+    {"verdict": str, "reason": str}, or {} on failure. Biased to Gemini to spare
+    the Groq budget.
+    """
+    prem = "\n".join(f"- {p}" for p in premises) or "(none)"
+    prompt = JUDGE_USER_PROMPT.format(premises=prem, conclusion=conclusion)
+    try:
+        result = _complete_json(JUDGE_SYSTEM_PROMPT, prompt, max_tokens=200, prefer="gemini")
+    except ValueError:
+        return {}
+    if isinstance(result, dict) and result.get("verdict") in ("true", "false", "unverifiable"):
+        return {"verdict": result["verdict"], "reason": str(result.get("reason", ""))}
+    return {}
