@@ -141,6 +141,7 @@ def insert_node(
     event_date: Optional[str] = None,
     expires_at: Optional[str] = None,
     depth: int = 0,
+    source_weight: Optional[float] = None,
     embedding: Optional[Embedding] = None,
 ) -> dict[str, Any]:
     if node_category not in NODE_CATEGORIES:
@@ -162,6 +163,9 @@ def insert_node(
         "source_url": source_url,
         "event_date": event_date,
         "expires_at": expires_at,
+        # Only written when provided, so the column stays unrequired for the
+        # baseline path (and absent DBs don't break on insert).
+        "source_weight": source_weight,
     }
     payload.update({k: v for k, v in optional.items() if v is not None})
     if embedding is not None:
@@ -472,6 +476,20 @@ def mark_nodes_processed(ids: Sequence[str]) -> None:
     client().table("nodes").update({"inference_processed": True}).in_(
         "id", list(ids)
     ).execute()
+
+
+def source_weights(ids: Sequence[str]) -> dict[str, float]:
+    """Map node_id -> source_weight for the given ids (default 1.0 when null).
+
+    Fetched on demand (only when source weighting is enabled) so the column is not
+    required by the baseline path. Selecting it does require the column to exist.
+    """
+    if not ids:
+        return {}
+    rows = (
+        client().table("nodes").select("id,source_weight").in_("id", list(ids)).execute().data or []
+    )
+    return {r["id"]: (r.get("source_weight") if r.get("source_weight") is not None else 1.0) for r in rows}
 
 
 def nodes_by_ids(ids: Sequence[str], limit: int = 200) -> list[dict[str, Any]]:

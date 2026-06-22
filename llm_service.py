@@ -465,11 +465,18 @@ def _origin_label(node: dict) -> str:
     return "observed report"
 
 
-def reason_pair(node_a: dict, node_b: dict) -> dict:
+REASON_PAIR_NOVELTY_CLAUSE = """
+
+NOVELTY REQUIREMENT: the conclusion must introduce a NEW fact, cause, or consequence that NEITHER premise states, and that is not merely a paraphrase, summary, or generalization of either premise. If the only thing that follows is a restatement of a premise, return {{"content": null}}."""
+
+
+def reason_pair(node_a: dict, node_b: dict, require_novel: bool = False) -> dict:
     """Pass 1: open-ended logical inference combining two premises (a + b => c).
 
     Returns {content, confidence, reasoning}, or {} if no meaningful inference
     follows. Biased to the Gemini backend to spare the scarce Groq token budget.
+    When `require_novel` is set, the conclusion must go beyond restating either
+    premise (used when chaining off a derived premise, to force synthesis).
     """
     prompt = REASON_PAIR_USER_PROMPT.format(
         a_origin=_origin_label(node_a),
@@ -483,6 +490,8 @@ def reason_pair(node_a: dict, node_b: dict) -> dict:
         b_subject=node_b.get("subject") or "unknown",
         b_content=node_b.get("content", ""),
     )
+    if require_novel:
+        prompt += REASON_PAIR_NOVELTY_CLAUSE
     try:
         result = _complete_json(
             REASON_PAIR_SYSTEM_PROMPT, prompt, max_tokens=512, prefer="gemini"

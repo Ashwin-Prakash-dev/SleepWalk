@@ -13,8 +13,16 @@ Answers the four things the Phase-1 gate cares about (see
   4. convergence independence — no "self-echo" (converged pair sharing raw grounding).
 Read-only.
 """
+import sys
+
 import db
-from ingestion import INDEPENDENCE_MAX_OVERLAP, _jaccard, _to_float
+from embeddings import embed
+from ingestion import INDEPENDENCE_MAX_OVERLAP, MERGE_THRESHOLD, _cosine, _jaccard, _to_float
+
+try:  # node content can contain non-cp1252 chars; keep prints from crashing on Windows
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 c = db.client()
 infs = (
@@ -43,6 +51,7 @@ for d in sorted(dist):
 print("\n=== MULTI-HOP INFERENCES (depth >= 2) + their premises ===")
 multi = [n for n in infs if int(n.get("depth") or 0) >= 2]
 violations, permitted_lifts = [], []
+novel_multi = 0  # depth>=2 conclusions that are NOT near-restatements of a derived premise
 if not multi:
     print("  (none — no derived node was built on another inference yet)")
 for n in multi:
@@ -61,6 +70,11 @@ for n in multi:
 
     if not derived_premises:
         continue
+    # Novel = the conclusion isn't a near-restatement of any derived premise.
+    n_emb = embed(n["content"])
+    max_sim = max(_cosine(n_emb, embed(p["content"])) for p in derived_premises)
+    if max_sim < MERGE_THRESHOLD:
+        novel_multi += 1
     premise_cap = min(_to_float(p.get("confidence"), 1.0) for p in derived_premises)
     if n["confidence"] <= premise_cap + 1e-9:
         continue
@@ -78,6 +92,15 @@ for n in multi:
     )
     rec = (n, premise_cap, independent_support, independent_conv)
     (permitted_lifts if (independent_support or independent_conv) else violations).append(rec)
+
+multi_with_derived = sum(
+    1 for n in multi
+    if any(prem.get("node_category") == "inference"
+           for prem in db.nodes_by_ids(db.derives_from_targets(n["id"])))
+)
+print("\n=== NOVEL-DEPTH RATE (multi-hop that isn't a restatement) ===")
+print(f"  {novel_multi} of {multi_with_derived} multi-hop conclusions are novel "
+      f"(cosine < {MERGE_THRESHOLD} to every derived premise)")
 
 print("\n=== CONFIDENCE MONOTONICITY (independence-aware) ===")
 if not violations:

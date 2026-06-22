@@ -22,9 +22,18 @@ import sys
 from collections import OrderedDict
 
 import db
+import ingestion
 import seed_large  # reuse reset()
 import seed_roots
+import sources
 from ingestion import ingest_text, run_inference_batch
+
+# Real-news titles can contain non-cp1252 chars (e.g. ₹); the Windows console
+# defaults to cp1252, so make stdout encode-safe rather than crash a progress print.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 SNAPSHOT_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "seed_data", "news_snapshot.jsonl"
@@ -99,8 +108,10 @@ def main() -> None:
     print(f"ingesting {len(articles)} cleaned articles ...")
     for i, a in enumerate(articles, 1):
         text = f"{a['title']}. {_clean_description(a['description'])}"
+        # Persist a source weight only when the feature is on (keeps the column unrequired otherwise).
+        weight = sources.weight_for(a.get("source")) if ingestion.USE_SOURCE_WEIGHTS else None
         try:
-            node_id = ingest_text(text, a.get("url"), event_date=a.get("published_at"))
+            node_id = ingest_text(text, a.get("url"), event_date=a.get("published_at"), source_weight=weight)
             print(f"[{i}/{len(articles)}] {node_id}  {a['title'][:64]}")
         except Exception as exc:
             print(f"[{i}/{len(articles)}] FAILED: {exc}  ({a['title'][:44]})")

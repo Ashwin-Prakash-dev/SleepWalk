@@ -121,6 +121,15 @@ EVIDENCE_RERANK_POOL = 40      # wider pre-rerank pool; post-rerank still EVIDEN
 USE_NLI_CLASSIFIER   = os.environ.get("ENCELADUS_NLI_CLASSIFIER", "llm")
 NLI_ENTAIL_THRESHOLD = 0.6     # P(entailment) >= this => supports_inference
 NLI_CONTRA_THRESHOLD = 0.6     # P(contradiction) >= this => supports_alternative (defeater)
+#
+# Phase 1: weight coverage/corroboration by source reliability (see sources.py).
+USE_SOURCE_WEIGHTS = os.environ.get("ENCELADUS_SOURCE_WEIGHTS", "0") == "1"
+#
+# Phase 2: when chaining off a derived premise, pair it with DISTINCT events
+# (not its own sources / near-restatements) so deepening synthesises rather than
+# restates. See [[inference-forward-chaining-design]].
+SYNTH_DISTINCT_PAIRING = os.environ.get("ENCELADUS_SYNTH_DISTINCT", "0") == "1"
+SYNTH_MAX_PARTNER_SIM  = 0.90  # when distinct-pairing a derived premise, skip partners above this
 
 # Module-level embedding cache, keyed by node id (content embeddings are stable).
 _emb_cache: dict[str, list[float]] = {}
@@ -327,12 +336,18 @@ def _link_entities(
 
 
 # --- pipeline ----------------------------------------------------------------
-def ingest_text(text: str, source_url: str = None, event_date: str = None) -> str:
+def ingest_text(
+    text: str, source_url: str = None, event_date: str = None, source_weight: float = None
+) -> str:
     """Run the full ingestion pipeline on one piece of text.
 
     `event_date` (ISO string, optional) records when the event actually occurred —
     e.g. a news article's publishedAt — so coverage / time-window / convergence
     reason over real dates instead of ingestion time. Defaults to None (unchanged).
+
+    `source_weight` (optional [0,1]) records source reliability; only persisted when
+    provided (source weighting is opt-in, see USE_SOURCE_WEIGHTS), so the baseline
+    path neither writes nor requires the column.
 
     Returns the id of the inserted raw-input node.
     """
@@ -365,6 +380,7 @@ def ingest_text(text: str, source_url: str = None, event_date: str = None) -> st
         source_url=source_url,
         event_date=event_date,
         expires_at=node.get("expires_at"),
+        source_weight=source_weight,
         embedding=embedding,
     )
     new_id = new_row["id"]
@@ -443,7 +459,9 @@ def run_inference_batch(force: bool = False) -> dict:
 
         created_nodes: list[dict] = []
         for node_a, node_b, _sim in pairs:
-            inf = reason_pair(node_a, node_b)
+            # Force a non-restatement conclusion when chaining off a derived premise.
+            chaining = node_a.get("node_category") == "inference" or node_b.get("node_category") == "inference"
+            inf = reason_pair(node_a, node_b, require_novel=SYNTH_DISTINCT_PAIRING and chaining)
             if not inf or not inf.get("content"):
                 continue
             # Drop redundant restatements BEFORE the costly verification step.
@@ -655,6 +673,12 @@ def _candidate_pairs(new_nodes: list[dict]) -> list[tuple[dict, dict, float]]:
         inf_ids = [p["id"] for p in partners if p.get("node_category") == "inference"]
         statuses = db.inference_statuses(inf_ids) if inf_ids else {}
 
+        # When chaining off a derived premise, force synthesis (not restatement):
+        # pair it only with events that add NEW grounding — never its own sources,
+        # never a near-restatement.
+        distinct_mode = SYNTH_DISTINCT_PAIRING and node_a.get("node_category") == "inference"
+        premise_roots = set(db.derivation_roots(node_a["id"])) if distinct_mode else set()
+
         scored: list[tuple[float, dict]] = []
         for partner in partners:
             if not _is_valid_premise(partner, node_a, statuses):
@@ -662,6 +686,8 @@ def _candidate_pairs(new_nodes: list[dict]) -> list[tuple[dict, dict, float]]:
             sim = _cosine(a_emb, _node_embedding(partner))
             if sim < MIN_PAIR_SIMILARITY or sim >= DUPLICATE_THRESHOLD:
                 continue
+            if distinct_mode and (partner["id"] in premise_roots or sim >= SYNTH_MAX_PARTNER_SIM):
+                continue  # its own source / near-restatement => no new conclusion
             scored.append((sim, partner))
 
         scored.sort(key=lambda t: t[0], reverse=True)
@@ -741,10 +767,17 @@ def _coverage(node_a: dict, node_b: dict) -> float:
     window = db.nodes_in_time_window(start, end, 200)
     actors = {node_a.get("actor"), node_b.get("actor")} - {None}
     subjects = {node_a.get("subject"), node_b.get("subject")} - {None}
-    related = sum(
-        1 for n in window
+    related_ids = [
+        n["id"] for n in window
         if n.get("actor") in actors or n.get("subject") in subjects
-    )
+    ]
+    if USE_SOURCE_WEIGHTS:
+        # Weight each related node by its source reliability, so density from
+        # reputable sources corroborates and low-credibility churn does not.
+        weights = db.source_weights(related_ids)
+        related = sum(weights.get(i, 1.0) for i in related_ids)
+    else:
+        related = len(related_ids)
     return min(1.0, related / COVERAGE_SATURATION)
 
 
@@ -863,7 +896,13 @@ def _verify_inference(
     elif support_ids and coverage >= COVERAGE_CORROBORATION_MIN and empty_high:
         status = "corroborated"
         mean_rep = sum(empty_high) / len(empty_high)
-        conf = min(1.0, base_conf + CORROBORATION_BONUS * coverage * mean_rep)
+        bonus_scale = mean_rep
+        if USE_SOURCE_WEIGHTS:
+            # Corroboration from reliable sources earns more of the bonus.
+            sw = db.source_weights(support_ids)
+            if sw:
+                bonus_scale *= sum(sw.values()) / len(sw)
+        conf = min(1.0, base_conf + CORROBORATION_BONUS * coverage * bonus_scale)
     else:
         status = "unverified"
         conf = min(base_conf, UNVERIFIED_CONFIDENCE_CAP)

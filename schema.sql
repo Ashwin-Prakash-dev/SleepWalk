@@ -39,6 +39,10 @@ alter table nodes add column if not exists inference_processed boolean default f
 -- Derivation depth: raw_input nodes are 0; a derived inference is 1 + max(premise
 -- depths). Lets the forward-chaining engine layer by epistemic depth and cap it.
 alter table nodes add column if not exists depth int default 0;
+-- Source credibility weight in [0,1] (default 1.0). Written only when source
+-- weighting is enabled (see ingestion.USE_SOURCE_WEIGHTS); coverage/corroboration
+-- weight evidence by it so reputable sources count for more.
+alter table nodes add column if not exists source_weight float default 1.0;
 
 create table if not exists edges (
   id         uuid primary key default gen_random_uuid(),

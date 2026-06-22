@@ -1,5 +1,12 @@
 """Quick inspection of what the seed produced."""
+import sys
+
 import db
+
+try:  # node content can contain non-cp1252 chars; keep prints from crashing on Windows
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 print("=== TOPICS ===")
 topics = db.client().table("topics").select("name,aliases").order("name").execute().data
