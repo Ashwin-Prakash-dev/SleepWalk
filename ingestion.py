@@ -13,6 +13,7 @@ plus whatever llm_service.py and db.py need.
 """
 from __future__ import annotations
 
+import math
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -84,6 +85,10 @@ CORROBORATION_BONUS         = 0.25  # max additive bonus, scaled by coverage * m
 CONVERGENCE_THRESHOLD       = 0.82  # cosine for "the same inference" (calibrated for MiniLM scale)
 CONVERGENCE_BONUS           = 0.15  # additive per independent re-derivation (still coverage-gated)
 INDEPENDENCE_MAX_OVERLAP    = 0.34  # source-set Jaccard above which a rederivation is NOT independent
+# Convergence is a form of corroboration: by default it only strengthens an already
+# 'corroborated' verdict, and only on the strength of OTHER 'corroborated' inferences.
+# ENCELADUS_CONVERGENCE_LEGACY=1 restores the old (buggy) unconditional bonus.
+CONVERGENCE_LEGACY = os.environ.get("ENCELADUS_CONVERGENCE_LEGACY", "0") == "1"
 
 # --- forward-chaining (derived nodes as premises) ----------------------------
 # A corroborated inference may itself become a PREMISE for new reasoning, enabling
@@ -130,6 +135,12 @@ USE_SOURCE_WEIGHTS = os.environ.get("ENCELADUS_SOURCE_WEIGHTS", "0") == "1"
 # restates. See [[inference-forward-chaining-design]].
 SYNTH_DISTINCT_PAIRING = os.environ.get("ENCELADUS_SYNTH_DISTINCT", "0") == "1"
 SYNTH_MAX_PARTNER_SIM  = 0.90  # when distinct-pairing a derived premise, skip partners above this
+#
+# Defeater policy: "strict" (default, baseline) contests on ANY defeater; "weighted"
+# contests only when defeaters aren't dominated by supports (one stray misclassified
+# node no longer flips a well-supported claim).
+DEFEATER_POLICY        = os.environ.get("ENCELADUS_DEFEATER_POLICY", "strict")
+DEFEATER_SUPPORT_RATIO = 0.5   # weighted: contest iff len(defeaters) >= max(1, ceil(RATIO*len(supports)))
 
 # Module-level embedding cache, keyed by node id (content embeddings are stable).
 _emb_cache: dict[str, list[float]] = {}
@@ -844,6 +855,20 @@ def _classify_evidence(
     return classify_evidence(inference_content, alternatives, retrieved)  # "llm" / default
 
 
+def _should_contest(defeater_ids: list, support_ids: list) -> bool:
+    """Whether defeater evidence should flip the verdict to 'contested'.
+
+    "strict" (default, baseline): any defeater contests. "weighted": contest only
+    when the defeaters aren't dominated by supports — so a single misclassified node
+    can't flip a well-supported claim. Threshold via DEFEATER_SUPPORT_RATIO.
+    """
+    if not defeater_ids:
+        return False
+    if DEFEATER_POLICY == "weighted":
+        return len(defeater_ids) >= max(1, math.ceil(DEFEATER_SUPPORT_RATIO * len(support_ids)))
+    return True  # strict: baseline behaviour
+
+
 def _verify_inference(
     inference: dict, node_a: dict, node_b: dict, base_conf: float
 ) -> dict:
@@ -890,7 +915,7 @@ def _verify_inference(
     # learned, calibrated model once a labeled set exists (features: support/defeater
     # counts, coverage, reportability, rerank/NLI scores). Keep this branch as the
     # baseline fallback.
-    if defeater_ids:
+    if _should_contest(defeater_ids, support_ids):
         status = "contested"
         conf = base_conf * DEFEATER_PENALTY
     elif support_ids and coverage >= COVERAGE_CORROBORATION_MIN and empty_high:
@@ -957,13 +982,43 @@ def _detect_convergence(inf_embedding: list[float], source_roots: list[str]) -> 
     """
     convergent: list[str] = []
     src = set(source_roots)
-    for m in db.match_inferences(inf_embedding, CONVERGENCE_THRESHOLD, 10):
+    matches = db.match_inferences(inf_embedding, CONVERGENCE_THRESHOLD, 10)
+    # Fixed behaviour: a re-derivation only counts as corroborating convergence if it
+    # is itself 'corroborated' (this also makes the stored converged_with honest).
+    statuses = {} if CONVERGENCE_LEGACY else db.inference_statuses([m["id"] for m in matches])
+    for m in matches:
         existing_roots = set(db.derivation_roots(m["id"]))
         if not existing_roots:
             continue
-        if _jaccard(src, existing_roots) <= INDEPENDENCE_MAX_OVERLAP:
-            convergent.append(m["id"])
+        if _jaccard(src, existing_roots) > INDEPENDENCE_MAX_OVERLAP:
+            continue
+        if not CONVERGENCE_LEGACY and statuses.get(m["id"]) != "corroborated":
+            continue
+        convergent.append(m["id"])
     return convergent
+
+
+def _convergence_confidence(
+    verdict: dict, node_a: dict, node_b: dict, emb: list[float], source_roots: list[str]
+) -> tuple[float, list[str]]:
+    """Apply the convergence bonus (then the independence cap) to a verdict's conf.
+
+    The bonus only strengthens an already-'corroborated' verdict — so it can never
+    lift an 'unverified' conclusion above its cap or boost a 'contested' one past its
+    defeater penalty. ENCELADUS_CONVERGENCE_LEGACY restores the old unconditional add.
+    Shared by _persist_inference and eval._predict so both see the same confidence.
+    """
+    convergent = _detect_convergence(emb, source_roots)
+    conf = verdict["confidence"]
+    if convergent and (CONVERGENCE_LEGACY or verdict["status"] == "corroborated"):
+        conf = min(
+            _coverage_ceiling(verdict["coverage"]),
+            conf + CONVERGENCE_BONUS * len(convergent),
+        )
+    # Min-chain monotonicity (with independence exception): a derived conclusion
+    # can't out-confidence its premises on the strength of shared evidence alone.
+    conf = _independence_capped_confidence(conf, verdict, node_a, node_b, convergent)
+    return conf, convergent
 
 
 def _persist_inference(
@@ -980,18 +1035,9 @@ def _persist_inference(
     # contributes its own raw ancestors rather than itself.
     source_roots = _derivation_roots(node_a, node_b)
 
-    # Detect convergence BEFORE insert so we don't match the row against itself.
-    convergent = _detect_convergence(emb, source_roots)
-    conf = verdict["confidence"]
-    if convergent:
-        conf = min(
-            _coverage_ceiling(verdict["coverage"]),
-            conf + CONVERGENCE_BONUS * len(convergent),
-        )
-
-    # Min-chain monotonicity (with independence exception): a derived conclusion
-    # can't out-confidence its premises on the strength of shared evidence alone.
-    conf = _independence_capped_confidence(conf, verdict, node_a, node_b, convergent)
+    # Detect convergence + finalize confidence. Shared with eval._predict so the
+    # eval measures the confidence actually stored (incl. the convergence step).
+    conf, convergent = _convergence_confidence(verdict, node_a, node_b, emb, source_roots)
 
     depth = 1 + max(_node_depth(node_a), _node_depth(node_b))
     inf_row = db.insert_node(

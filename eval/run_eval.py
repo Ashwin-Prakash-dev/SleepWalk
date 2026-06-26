@@ -28,12 +28,14 @@ LABELS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "labels.j
 TRUTH_VALUES = ("true", "false", "unverifiable")
 STATUSES = ("corroborated", "contested", "unverified")
 
-# Phase 3 comparison grid: baseline + each phase, then both stacked.
+# Bug-fix comparison grid: (convergence_legacy, defeater_policy). Holds the other
+# axis at its new default so each named change is isolated, plus the combined row.
 CONFIGS = [
-    ("baseline", False, "llm"),
-    ("+rerank",  True,  "llm"),
-    ("+nli",     False, "nli"),
-    ("+both",    True,  "nli"),
+    ("legacy-convergence", True,  "strict"),
+    ("fixed-convergence",  False, "strict"),
+    ("strict-defeater",    False, "strict"),
+    ("weighted-defeater",  False, "weighted"),
+    ("fixed+weighted",     False, "weighted"),
 ]
 
 
@@ -47,8 +49,11 @@ def _load_labeled() -> list[dict]:
             if not line:
                 continue
             r = json.loads(line)
-            if (r.get("truth") or "").strip() in TRUTH_VALUES:
+            raw = (r.get("truth") or "").strip()
+            if raw in TRUTH_VALUES:
                 rows.append(r)
+            elif raw:  # non-empty but not a valid label — still dropped, but say so
+                print(f"[warn] dropping row with malformed truth {raw!r} (node {r.get('node_id')})")
     rows.sort(key=lambda r: r["node_id"])  # determinism over a fixed set
     return rows
 
@@ -66,10 +71,16 @@ def _predict(row: dict):
     premises = db.nodes_by_ids(db.derives_from_targets(row["node_id"]))
     if len(premises) < 2:
         return None  # need both premises to reconstruct the verification context
+    node_a, node_b = premises[0], premises[1]
     verdict = ingestion._verify_inference(
-        {"content": row["content"]}, premises[0], premises[1], _base_conf(row["node_id"])
+        {"content": row["content"]}, node_a, node_b, _base_conf(row["node_id"])
     )
-    return verdict["status"], float(verdict["confidence"])
+    # Mirror _persist_inference's finalization so the eval measures the confidence
+    # actually stored (incl. the convergence step) — needed to see the Change-1 fix.
+    emb = ingestion.embed(row["content"])
+    source_roots = ingestion._derivation_roots(node_a, node_b)
+    conf, _ = ingestion._convergence_confidence(verdict, node_a, node_b, emb, source_roots)
+    return verdict["status"], float(conf)
 
 
 def _evaluate(rows: list[dict]) -> list[tuple]:
@@ -145,17 +156,17 @@ def _report_compare(rows):
     print("=" * 60)
     print(f"CONFIG COMPARISON  (n_labeled={len(rows)})")
     print("-" * 60)
-    print(f"  {'config':>10} {'precision':>10} {'recall':>8} {'F1':>7} {'ECE':>7}")
-    saved = (ingestion.RERANK_EVIDENCE, ingestion.USE_NLI_CLASSIFIER)
+    print(f"  {'config':>18} {'precision':>10} {'recall':>8} {'F1':>7} {'ECE':>7}")
+    saved = (ingestion.CONVERGENCE_LEGACY, ingestion.DEFEATER_POLICY)
     try:
-        for name, rer, cls in CONFIGS:
-            ingestion.RERANK_EVIDENCE, ingestion.USE_NLI_CLASSIFIER = rer, cls
+        for name, conv_legacy, defeater in CONFIGS:
+            ingestion.CONVERGENCE_LEGACY, ingestion.DEFEATER_POLICY = conv_legacy, defeater
             records = _evaluate(rows)
             p, r, f1 = _prf(records)
             ece, _ = _calibration(records)
-            print(f"  {name:>10} {p:>10.3f} {r:>8.3f} {f1:>7.3f} {ece:>7.3f}")
+            print(f"  {name:>18} {p:>10.3f} {r:>8.3f} {f1:>7.3f} {ece:>7.3f}")
     finally:
-        ingestion.RERANK_EVIDENCE, ingestion.USE_NLI_CLASSIFIER = saved
+        ingestion.CONVERGENCE_LEGACY, ingestion.DEFEATER_POLICY = saved
     print("=" * 60)
 
 
