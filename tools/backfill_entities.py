@@ -13,7 +13,10 @@ Run:  python backfill_entities.py
 """
 from __future__ import annotations
 
+import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root on sys.path
 
 import db
 from embeddings import embed

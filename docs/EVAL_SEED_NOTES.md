@@ -7,7 +7,7 @@ likely `status` and the **warranted truth** — those are what make precision an
 recall measurable. (Your previous label set was ~14 true / 2 false, so precision
 rested on two examples and recall was effectively unmeasurable.)
 
-Run: `python seed_eval.py --reset`, then read `/dashboard` (or
+Run: `python seeds/seed_eval.py --reset`, then read `/dashboard` (or
 `python eval/label_dump.py`) against the table below.
 
 Two distinct things are being checked per scenario:

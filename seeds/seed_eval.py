@@ -35,6 +35,8 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root on sys.path
+
 import db
 import ingestion
 import seed_large  # reuse reset()

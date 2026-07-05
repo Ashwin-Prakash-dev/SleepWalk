@@ -51,7 +51,7 @@ create table if not exists edges (
   edge_type  text not null check (edge_type in (
                'same_subject', 'same_actor', 'semantically_similar',
                'derives_from', 'contradicts',
-               'corroborated_by', 'converges_with')),
+               'corroborated_by', 'converges_with', 'supersedes')),
   weight     float default 1.0,
   created_at timestamptz default now()
 );
@@ -60,7 +60,8 @@ create table if not exists edges (
 alter table edges drop constraint if exists edges_edge_type_check;
 alter table edges add constraint edges_edge_type_check check (edge_type in (
   'same_subject', 'same_actor', 'semantically_similar',
-  'derives_from', 'contradicts', 'corroborated_by', 'converges_with'));
+  'derives_from', 'contradicts', 'corroborated_by', 'converges_with',
+  'supersedes'));  -- supersedes: a newer report overtakes an older one (belief revision)
 
 -- node_entities: many-to-many between nodes and the entities they involve, with
 -- a role per link. Additive alongside nodes.entity_id (which stays the single
@@ -371,3 +372,9 @@ language sql stable as $$
   join nodes n on n.id = chain.id
   where n.node_category = 'raw_input';
 $$;
+
+-- 11. Belief revision (living model) -----------------------------------------
+-- revised_at: when the engine last RE-verified this inference against newly
+-- arrived evidence (null = never revised since creation). Supersession itself is
+-- an edge ('supersedes', newer -> older) plus the CHECK addition in section 2.
+alter table inference_meta add column if not exists revised_at timestamptz;

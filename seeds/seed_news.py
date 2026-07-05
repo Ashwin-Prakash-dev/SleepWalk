@@ -21,6 +21,8 @@ import re
 import sys
 from collections import OrderedDict
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root on sys.path
+
 import db
 import ingestion
 import seed_large  # reuse reset()
@@ -36,7 +38,7 @@ except Exception:
     pass
 
 SNAPSHOT_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "seed_data", "news_snapshot.jsonl"
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "seed_data", "news_snapshot.jsonl"
 )
 # Sources that publish multi-headline digests rather than single-event articles.
 AGGREGATOR_SOURCES = {"Slashdot.org", "Google News", "Yahoo Entertainment"}

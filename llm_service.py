@@ -386,12 +386,14 @@ REASON_PAIR_USER_PROMPT = """Two premises have been observed. State the single s
 
 A premise tagged "derived inference" is a PRIOR CONCLUSION, not a direct observation: treat it as provisional, and let your confidence reflect that the chain is only as strong as its weakest link.
 
+TEMPORAL ORDER: each premise carries the date its event occurred. A cause cannot postdate its effect — never conclude that the later event caused or triggered the earlier one.
+
 PREMISE A ({a_origin}):
-actor={a_actor} | kind={a_kind} | subject={a_subject}
+actor={a_actor} | kind={a_kind} | subject={a_subject} | date={a_date}
 {a_content}
 
 PREMISE B ({b_origin}):
-actor={b_actor} | kind={b_kind} | subject={b_subject}
+actor={b_actor} | kind={b_kind} | subject={b_subject} | date={b_date}
 {b_content}
 
 Return a JSON object:
@@ -435,9 +437,9 @@ RETRIEVED NODES (0-indexed):
 {nodes}
 
 For each retrieved node, classify it relative to the inference and the alternatives:
-- "supports_inference": the node is evidence FOR the inference.
-- "supports_alternative": the node is evidence for one of the competing alternatives (a defeater); set alternative_index to that alternative's 0-based index.
-- "irrelevant": the node supports neither the inference nor any alternative.
+- "supports_inference": the node DIRECTLY evidences the inference — it states, confirms, or is a clear consequence of the specific claim.
+- "supports_alternative": the node DIRECTLY evidences one of the competing alternatives, or is factually INCOMPATIBLE with the inference (a defeater); set alternative_index to that alternative's 0-based index.
+- "irrelevant": neither of the above. IMPORTANT: merely sharing actors, topics, timing, or general thematic tension with the inference is NOT support and NOT contradiction — classify such nodes "irrelevant". When unsure, choose "irrelevant".
 
 Return a JSON array with one object per retrieved node, each:
 - index: integer (the node's 0-based index above)
@@ -483,11 +485,13 @@ def reason_pair(node_a: dict, node_b: dict, require_novel: bool = False) -> dict
         a_actor=node_a.get("actor") or "unknown",
         a_kind=node_a.get("node_kind") or "unknown",
         a_subject=node_a.get("subject") or "unknown",
+        a_date=(node_a.get("event_date") or "unknown")[:10],
         a_content=node_a.get("content", ""),
         b_origin=_origin_label(node_b),
         b_actor=node_b.get("actor") or "unknown",
         b_kind=node_b.get("node_kind") or "unknown",
         b_subject=node_b.get("subject") or "unknown",
+        b_date=(node_b.get("event_date") or "unknown")[:10],
         b_content=node_b.get("content", ""),
     )
     if require_novel:

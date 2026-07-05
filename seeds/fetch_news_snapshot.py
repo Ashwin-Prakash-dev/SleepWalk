@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 NEWSAPI_URL = "https://newsapi.org/v2/everything"
-OUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seed_data", "news_snapshot.jsonl")
+OUT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "seed_data", "news_snapshot.jsonl")
 
 # Many DISTINCT-but-linked sub-topics across domains, so genuine multi-hop chains
 # can form (e.g. pipeline strike -> oil exports -> gas prices) rather than one

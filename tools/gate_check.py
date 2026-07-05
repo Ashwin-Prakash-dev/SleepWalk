@@ -13,7 +13,10 @@ Answers the four things the Phase-1 gate cares about (see
   4. convergence independence — no "self-echo" (converged pair sharing raw grounding).
 Read-only.
 """
+import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root on sys.path
 
 import db
 from embeddings import embed

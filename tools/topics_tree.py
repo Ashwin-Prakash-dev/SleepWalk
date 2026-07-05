@@ -7,7 +7,10 @@ Each line shows [direct N / rollup M]: N nodes tagged with that exact topic, M
 nodes tagged with it OR any descendant (the read-time rollup). A topic reachable
 by more than one parent (a DAG diamond) is printed under each but expanded once.
 """
+import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root on sys.path
 
 import db
 

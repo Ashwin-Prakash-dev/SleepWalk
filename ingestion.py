@@ -142,6 +142,24 @@ SYNTH_MAX_PARTNER_SIM  = 0.90  # when distinct-pairing a derived premise, skip p
 DEFEATER_POLICY        = os.environ.get("ENCELADUS_DEFEATER_POLICY", "strict")
 DEFEATER_SUPPORT_RATIO = 0.5   # weighted: contest iff len(defeaters) >= max(1, ceil(RATIO*len(supports)))
 
+# --- Phase 3: belief revision (living model) ----------------------------------
+# The graph revises instead of only accumulating: a newer report can SUPERSEDE an
+# older one (edge newer->older; overtaken nodes stop corroborating and count less
+# toward coverage), and new evidence RE-OPENS existing verdicts (budgeted re-run of
+# Pass 2, recorded in inference_meta.revised_at). See [[project-north-star]].
+BELIEF_REVISION  = os.environ.get("ENCELADUS_BELIEF_REVISION", "1") == "1"
+SUPERSESSION     = os.environ.get("ENCELADUS_SUPERSESSION", "1") == "1"
+SUPERSEDE_SIMILARITY       = 0.75  # cosine floor for "same story, updated" (+ same actor + later date)
+SUPERSEDE_MAX_PER_NODE     = 3
+SUPERSEDED_COVERAGE_WEIGHT = 0.3   # overtaken nodes count this much toward coverage
+REVERIFY_SIMILARITY        = 0.50  # a new node at least this close to an inference re-opens it
+REVERIFY_MAX_PER_BATCH     = 6     # LLM budget: re-verifications per batch
+#
+# Scope the indiscriminate time-window evidence pull to nodes sharing an actor or
+# entity with the premises — the unscoped pull floods verification with same-era
+# but unrelated stories (the cross-scenario defeater bleed seen in the diagnostic).
+SCOPED_RETRIEVAL = os.environ.get("ENCELADUS_SCOPED_RETRIEVAL", "1") == "1"
+
 # Module-level embedding cache, keyed by node id (content embeddings are stable).
 _emb_cache: dict[str, list[float]] = {}
 
@@ -346,6 +364,53 @@ def _link_entities(
         db.insert_node_entity(node_id, entity_id, role)
 
 
+# Runtime guards: flip false (with one warning) if the live DB schema predates the
+# 'supersedes' edge type / inference_meta.revised_at — apply schema.sql to enable.
+_supersession_ok = True
+_revision_ok = True
+
+
+def _apply_supersession(new_id: str, actor: Optional[str], event_date: str, similar: list[dict]) -> None:
+    """Record supersedes edges from this node to older reports it overtakes.
+
+    Heuristic (no LLM): a candidate from the ingest similarity search is overtaken
+    if it is a raw_input node with the SAME actor, cosine >= SUPERSEDE_SIMILARITY,
+    and a strictly EARLIER event_date. Downstream, superseded nodes stop counting
+    as corroboration and count less toward coverage.
+    """
+    global _supersession_ok
+    if not _supersession_ok:
+        return
+    new_dt = _parse_ts(event_date)
+    if not new_dt or not actor:
+        return
+    cand = [m for m in similar if _to_float(m.get("similarity"), 0.0) >= SUPERSEDE_SIMILARITY]
+    if not cand:
+        return
+    rows = {r["id"]: r for r in db.nodes_by_ids([m["id"] for m in cand])}
+    made = 0
+    for m in cand:
+        row = rows.get(m["id"])
+        if not row or row.get("node_category") != "raw_input":
+            continue
+        if (row.get("actor") or "").strip().lower() != actor.strip().lower():
+            continue
+        old_dt = _parse_ts(row.get("event_date"))
+        if not old_dt or old_dt >= new_dt:
+            continue
+        try:
+            if not _edge_exists(new_id, row["id"], "supersedes"):
+                db.insert_edge(new_id, row["id"], "supersedes")
+        except Exception as exc:  # DB CHECK predates 'supersedes' — degrade loudly, once
+            _supersession_ok = False
+            print(f"[warn] supersedes edge rejected ({exc}); supersession disabled "
+                  f"for this run — apply schema.sql to enable belief revision")
+            return
+        made += 1
+        if made >= SUPERSEDE_MAX_PER_NODE:
+            break
+
+
 # --- pipeline ----------------------------------------------------------------
 def ingest_text(
     text: str, source_url: str = None, event_date: str = None, source_weight: float = None
@@ -419,6 +484,11 @@ def ingest_text(
         if sim > SIMILARITY_THRESHOLD and not _edge_exists(new_id, m["id"], "semantically_similar"):
             db.insert_edge(new_id, m["id"], "semantically_similar", weight=sim)
 
+    # Step 6b — supersession (belief revision): a dated report can overtake earlier
+    # reports of the same story (same actor, highly similar, strictly earlier date).
+    if SUPERSESSION and event_date:
+        _apply_supersession(new_id, actor, event_date, similar)
+
     # Step 7 — inference is no longer inline. The node is left
     # inference_processed=false; once INFERENCE_BATCH_SIZE such nodes accumulate,
     # the batched engine pairs and verifies them.
@@ -459,6 +529,7 @@ def run_inference_batch(force: bool = False) -> dict:
     # fixpoint (nothing promotable), the depth cap, or the global pair budget.
     frontier = new_nodes
     seen_ids = set(raw_ids)
+    all_created: set[str] = set()
     total_pairs = total_created = deduped = passes = 0
     budget = DEEPEN_GLOBAL_PAIR_CAP
 
@@ -483,7 +554,9 @@ def run_inference_batch(force: bool = False) -> dict:
                 continue
             base_conf = _propagate_confidence(_to_float(inf.get("confidence"), 0.6), node_a, node_b)
             verdict = _verify_inference(inf, node_a, node_b, base_conf)
-            created_nodes.append(_persist_inference(inf, node_a, node_b, base_conf, verdict))
+            row = _persist_inference(inf, node_a, node_b, base_conf, verdict)
+            created_nodes.append(row)
+            all_created.add(row["id"])
             total_created += 1
 
         # Promote only conclusions trustworthy enough to be premises and still able
@@ -497,11 +570,16 @@ def run_inference_batch(force: bool = False) -> dict:
         ]
         seen_ids.update(c["id"] for c in frontier)
 
+    # Phase 3 — belief revision: the new evidence may bear on EXISTING verdicts;
+    # re-open and re-verify the most affected ones (budgeted).
+    revised = _reverify_affected(new_nodes, exclude_ids=all_created) if BELIEF_REVISION else 0
+
     db.mark_nodes_processed(raw_ids)
     return {
         "pairs": total_pairs,
         "inferences": total_created,
         "deduped": deduped,
+        "revised": revised,
         "processed": len(raw_ids),
         "passes": passes,
     }
@@ -749,7 +827,19 @@ def _hybrid_retrieve(
             _add(nid)
 
     start, end = _time_window(node_a, node_b)
-    for n in db.nodes_in_time_window(start, end, 50):
+    window = db.nodes_in_time_window(start, end, 50)
+    if SCOPED_RETRIEVAL and window:
+        # Keep only window nodes that share an actor or entity with the premises —
+        # the unscoped pull floods the classifier with same-era, unrelated stories.
+        prem_actors = {node_a.get("actor"), node_b.get("actor")} - {None}
+        prem_entities = set(_entity_ids(node_a["id"])) | set(_entity_ids(node_b["id"]))
+        ent_map = db.node_entity_map([n["id"] for n in window])
+        window = [
+            n for n in window
+            if n.get("actor") in prem_actors
+            or (ent_map.get(n["id"], set()) & prem_entities)
+        ]
+    for n in window:
         _add(n["id"])
 
     rows = {r["id"]: r for r in db.nodes_by_ids(ordered_ids)}
@@ -757,6 +847,17 @@ def _hybrid_retrieve(
         rows[i] for i in ordered_ids
         if i in rows and rows[i].get("node_category") == "raw_input"
     ]
+    if BELIEF_REVISION:
+        # Staleness: an event_announcement whose expires_at has passed no longer
+        # counts as live evidence.
+        now = datetime.now(timezone.utc)
+        fresh = []
+        for e in evidence:
+            exp = _parse_ts(e.get("expires_at"))
+            if exp and exp < now:
+                continue
+            fresh.append(e)
+        evidence = fresh
 
     if RERANK_EVIDENCE and inference_content and evidence:
         import rerank  # local import: only loaded when reranking is enabled
@@ -782,13 +883,14 @@ def _coverage(node_a: dict, node_b: dict) -> float:
         n["id"] for n in window
         if n.get("actor") in actors or n.get("subject") in subjects
     ]
-    if USE_SOURCE_WEIGHTS:
-        # Weight each related node by its source reliability, so density from
-        # reputable sources corroborates and low-credibility churn does not.
-        weights = db.source_weights(related_ids)
-        related = sum(weights.get(i, 1.0) for i in related_ids)
-    else:
-        related = len(related_ids)
+    # Weight each related node: by source reliability (when enabled) and down-weight
+    # superseded (overtaken) reports so stale density can't manufacture coverage.
+    weights = db.source_weights(related_ids) if USE_SOURCE_WEIGHTS else {}
+    stale = db.superseded_node_ids(related_ids) if SUPERSESSION else set()
+    related = sum(
+        weights.get(i, 1.0) * (SUPERSEDED_COVERAGE_WEIGHT if i in stale else 1.0)
+        for i in related_ids
+    )
     return min(1.0, related / COVERAGE_SATURATION)
 
 
@@ -900,6 +1002,15 @@ def _verify_inference(
             ai = c.get("alternative_index")
             if isinstance(ai, int):
                 alt_supported.add(ai)
+
+    if SUPERSESSION and (support_ids or defeater_ids):
+        # Overtaken reports are history, not live evidence — they can neither
+        # corroborate nor contest. (Their alternative_index marks are kept, which
+        # only errs conservative: a once-supported alternative stays non-silent.)
+        stale = db.superseded_node_ids(support_ids + defeater_ids)
+        if stale:
+            support_ids = [i for i in support_ids if i not in stale]
+            defeater_ids = [i for i in defeater_ids if i not in stale]
 
     coverage = _coverage(node_a, node_b)
 
@@ -1019,6 +1130,89 @@ def _convergence_confidence(
     # can't out-confidence its premises on the strength of shared evidence alone.
     conf = _independence_capped_confidence(conf, verdict, node_a, node_b, convergent)
     return conf, convergent
+
+
+# --- Phase 3: belief revision (re-open verdicts as new evidence arrives) ------
+def _reverify_affected(new_nodes: list[dict], exclude_ids: set) -> int:
+    """Re-verify existing inferences the new raw nodes bear on. Returns the count.
+
+    Two triggers per new node: (a) it SUPERSEDES a node some inference derives
+    from — that premise is overtaken, re-open unconditionally; (b) it is
+    semantically close to an inference (>= REVERIFY_SIMILARITY) — potential new
+    support or defeater. Budgeted to REVERIFY_MAX_PER_BATCH per batch, highest
+    priority first; `exclude_ids` skips inferences created in this same batch.
+    """
+    if not _revision_ok:
+        return 0
+    candidates: dict[str, float] = {}
+    for node in new_nodes:
+        emb = _node_embedding(node)
+        for m in db.match_inferences(emb, REVERIFY_SIMILARITY, 5):
+            if m["id"] not in exclude_ids:
+                sim = _to_float(m.get("similarity"), 0.0)
+                candidates[m["id"]] = max(candidates.get(m["id"], 0.0), sim)
+        if SUPERSESSION:
+            for old_id in db.supersedes_targets(node["id"]):
+                for inf_id in db.inferences_deriving_from(old_id):
+                    if inf_id not in exclude_ids:
+                        candidates[inf_id] = 2.0  # premise overtaken: top priority
+    ranked = sorted(candidates.items(), key=lambda t: t[1], reverse=True)
+    revised = 0
+    for inf_id, _prio in ranked[:REVERIFY_MAX_PER_BATCH]:
+        if _reverify_one(inf_id):
+            revised += 1
+    return revised
+
+
+def _reverify_one(inf_id: str) -> bool:
+    """Re-run Pass 2 (+ convergence) for one stored inference and update its verdict.
+
+    Reuses the inference's original premises and base_confidence; the verdict,
+    confidence, evidence edges, and converged_with are all recomputed against the
+    CURRENT corpus, and inference_meta.revised_at records the revision.
+    """
+    rows = db.nodes_by_ids([inf_id])
+    if not rows:
+        return False
+    inf_node = rows[0]
+    premises = db.nodes_by_ids(db.derives_from_targets(inf_id))
+    if len(premises) < 2:
+        return False
+    meta = db.get_inference_meta(inf_id) or {}
+    base_conf = _to_float(meta.get("base_confidence"), 0.6)
+
+    verdict = _verify_inference({"content": inf_node["content"]}, premises[0], premises[1], base_conf)
+    conf, convergent = _convergence_confidence(
+        verdict, premises[0], premises[1],
+        embed(inf_node["content"]), _derivation_roots(premises[0], premises[1]),
+    )
+    global _revision_ok
+    try:
+        db.update_inference_verdict(
+            inf_id,
+            status=verdict["status"],
+            confidence=conf,
+            coverage=verdict["coverage"],
+            support_node_ids=verdict["support_ids"],
+            defeater_node_ids=verdict["defeater_ids"],
+            alternatives=verdict["alternatives"],
+            converged_with=convergent,
+            revised_at=datetime.now(timezone.utc).isoformat(),
+        )
+    except Exception as exc:  # inference_meta.revised_at missing — degrade loudly, once
+        _revision_ok = False
+        print(f"[warn] verdict update rejected ({exc}); belief revision disabled "
+              f"for this run — apply schema.sql (section 11) to enable")
+        return False
+    # Refresh the verification edges to mirror the new verdict.
+    db.delete_edges_from(inf_id, ["corroborated_by", "contradicts", "converges_with"])
+    for sid in verdict["support_ids"]:
+        db.insert_edge(inf_id, sid, "corroborated_by")
+    for did in verdict["defeater_ids"]:
+        db.insert_edge(inf_id, did, "contradicts")
+    for cid in convergent:
+        db.insert_edge(inf_id, cid, "converges_with")
+    return True
 
 
 def _persist_inference(

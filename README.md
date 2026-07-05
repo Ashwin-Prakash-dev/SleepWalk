@@ -6,13 +6,25 @@ similarity search over 1536-dim embeddings.
 
 ## Layout
 
-| File              | Purpose                                                        |
-| ----------------- | -------------------------------------------------------------- |
-| `schema.sql`      | Exact DDL: `vector` extension, tables, indexes, `match_nodes`. |
-| `db.py`           | Supabase Python client + typed helpers for the three tables.   |
-| `embeddings.py`   | OpenAI `text-embedding-3-small` → 1536-dim vectors.            |
-| `example.py`      | End-to-end smoke test (insert, link, search).                  |
-| `.env.example`    | Credential template — copy to `.env`.                          |
+```
+db.py ingestion.py llm_service.py    core library — data access, the ingestion +
+embeddings.py rerank.py nli.py       adversarial-inference engine, LLM router,
+sources.py                           and local models
+schema.sql                           exact DDL: tables, indexes, RPCs
+main.py  dashboard.html              FastAPI app + single-page dashboard
+seeds/                               corpus seeders: seed_large, seed_news,
+                                     seed_eval, seed_roots, fetch_news_snapshot
+seed_data/                           frozen real-news snapshot (committed)
+eval/                                labelling + run_eval measurement harness
+tools/                               inspection/diagnostics: graph_inspect,
+                                     gate_check, topics_tree, example, ...
+tests/                               pytest suite (root conftest.py sets the path)
+docs/                                EVAL_SEED_NOTES.md and other docs
+.env.example                         credential template — copy to `.env`
+```
+
+Scripts under `seeds/`, `tools/`, `tests/`, and `eval/` add the repo root to
+`sys.path`, so run them from the repo root — e.g. `python seeds/seed_eval.py --reset`.
 
 ## Setup
 
@@ -42,7 +54,7 @@ cp .env.example .env   # then edit .env
 ```bash
 python -m venv .venv && .venv\Scripts\activate   # Windows
 pip install -r requirements.txt
-python example.py
+python tools/example.py
 ```
 
 ## Usage

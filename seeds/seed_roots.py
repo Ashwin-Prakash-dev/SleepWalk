@@ -7,7 +7,10 @@ Curated roots bias classify_topic_parent onto a small shared vocabulary, so the
 hierarchy converges onto these instead of sprouting academic-discipline mega-roots
 like 'social sciences'. Keep the set small and concretely top-level.
 """
+import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root on sys.path
 
 import db
 from embeddings import embed

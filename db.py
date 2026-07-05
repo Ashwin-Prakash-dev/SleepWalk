@@ -28,6 +28,7 @@ EDGE_TYPES: frozenset[str] = frozenset({
     "same_subject", "same_actor", "semantically_similar",
     "derives_from", "contradicts",
     "corroborated_by", "converges_with",
+    "supersedes",  # newer report overtakes an older one (belief revision)
 })
 
 # An embedding is a 1536-element list of floats (vector(1536) in Postgres).
@@ -437,7 +438,7 @@ def stream_between_names(
 # which sidesteps parsing the pgvector wire format back into a list).
 INFERENCE_NODE_COLUMNS = (
     "id,node_category,node_kind,actor,subject,confidence,content,"
-    "source_url,event_date,created_at,depth"
+    "source_url,event_date,expires_at,created_at,depth"
 )
 
 
@@ -578,6 +579,92 @@ def derivation_roots(node_id: str) -> list[str]:
     """
     resp = client().rpc("derivation_roots", {"start_id": node_id}).execute()
     return [r["id"] for r in (resp.data or [])]
+
+
+def superseded_node_ids(ids: Sequence[str]) -> set:
+    """Subset of `ids` that have been overtaken (target of a 'supersedes' edge)."""
+    if not ids:
+        return set()
+    rows = (
+        client().table("edges").select("target_id")
+        .eq("edge_type", "supersedes").in_("target_id", list(ids))
+        .execute().data or []
+    )
+    return {r["target_id"] for r in rows}
+
+
+def supersedes_targets(node_id: str) -> list[str]:
+    """Older nodes this node supersedes (its outgoing 'supersedes' targets)."""
+    rows = (
+        client().table("edges").select("target_id")
+        .eq("edge_type", "supersedes").eq("source_id", node_id)
+        .execute().data or []
+    )
+    return [r["target_id"] for r in rows]
+
+
+def inferences_deriving_from(node_id: str) -> list[str]:
+    """Inference ids that directly derive from `node_id` (premise -> conclusions)."""
+    rows = (
+        client().table("edges").select("source_id")
+        .eq("edge_type", "derives_from").eq("target_id", node_id)
+        .execute().data or []
+    )
+    return [r["source_id"] for r in rows]
+
+
+def node_entity_map(node_ids: Sequence[str]) -> dict[str, set]:
+    """Map node_id -> set of entity ids, for a batch of nodes (one query)."""
+    if not node_ids:
+        return {}
+    rows = (
+        client().table("node_entities").select("node_id,entity_id")
+        .in_("node_id", list(node_ids)).execute().data or []
+    )
+    out: dict[str, set] = {}
+    for r in rows:
+        out.setdefault(r["node_id"], set()).add(r["entity_id"])
+    return out
+
+
+def get_inference_meta(node_id: str) -> Optional[dict[str, Any]]:
+    rows = (
+        client().table("inference_meta").select("*")
+        .eq("node_id", node_id).limit(1).execute().data
+    )
+    return rows[0] if rows else None
+
+
+def delete_edges_from(source_id: str, edge_types: Sequence[str]) -> None:
+    """Remove this node's outgoing edges of the given types (used on re-verification)."""
+    client().table("edges").delete().eq("source_id", source_id).in_(
+        "edge_type", list(edge_types)
+    ).execute()
+
+
+def update_inference_verdict(
+    node_id: str,
+    *,
+    status: str,
+    confidence: float,
+    coverage: float,
+    support_node_ids: Sequence[str],
+    defeater_node_ids: Sequence[str],
+    alternatives: Any,
+    converged_with: Sequence[str],
+    revised_at: str,
+) -> None:
+    """Overwrite an inference's verdict after re-verification (belief revision)."""
+    client().table("inference_meta").update({
+        "status": status,
+        "coverage": coverage,
+        "support_node_ids": list(support_node_ids),
+        "defeater_node_ids": list(defeater_node_ids),
+        "alternatives": alternatives,
+        "converged_with": list(converged_with),
+        "revised_at": revised_at,
+    }).eq("node_id", node_id).execute()
+    client().table("nodes").update({"confidence": confidence}).eq("id", node_id).execute()
 
 
 def inference_statuses(ids: Sequence[str]) -> dict[str, str]:
