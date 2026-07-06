@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -86,7 +87,18 @@ def _predict(row: dict):
 def _evaluate(rows: list[dict]) -> list[tuple]:
     records = []  # (pred_status, pred_conf, truth)
     for r in rows:
-        pred = _predict(r)
+        # A transient network/DB hiccup must not kill a long multi-call run:
+        # retry the row twice, then skip it with a warning (n is reported per run).
+        pred = None
+        for attempt in range(3):
+            try:
+                pred = _predict(r)
+                break
+            except Exception as exc:
+                if attempt == 2:
+                    print(f"[warn] skipping row {r.get('node_id')} after 3 attempts: {exc}")
+                else:
+                    time.sleep(2 * (attempt + 1))
         if pred is not None:
             records.append((pred[0], pred[1], (r["truth"] or "").strip()))
     return records
