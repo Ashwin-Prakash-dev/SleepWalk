@@ -59,6 +59,11 @@ def _first(resp: Any) -> dict[str, Any]:
     return resp.data[0]
 
 
+def _pg_quote(value: str) -> str:
+    """Escape a value for embedding inside a PostgREST filter string."""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
 # --- entities ----------------------------------------------------------------
 def insert_entity(
     name: str,
@@ -74,7 +79,19 @@ def insert_entity(
 
 
 def find_entity(name: str) -> Optional[dict[str, Any]]:
-    resp = client().table("entities").select("*").eq("name", name).limit(1).execute()
+    """Find an entity by canonical name OR alias (case-insensitive on name).
+
+    Alias-aware because on real data the canonical row is often not the surface
+    form callers use — e.g. the entity is 'US' with aliases ['United States',
+    'Washington']; a name-only match silently misses it (broke streams).
+    """
+    safe = _pg_quote(name)
+    resp = (
+        client().table("entities").select("*")
+        .or_(f'name.ilike."{safe}",aliases.cs.{{"{safe}"}}')
+        .limit(1)
+        .execute()
+    )
     return resp.data[0] if resp.data else None
 
 
@@ -579,6 +596,17 @@ def derivation_roots(node_id: str) -> list[str]:
     """
     resp = client().rpc("derivation_roots", {"start_id": node_id}).execute()
     return [r["id"] for r in (resp.data or [])]
+
+
+def existing_source_urls(urls: Sequence[str]) -> set:
+    """Subset of `urls` already present on nodes (idempotent incremental ingest)."""
+    if not urls:
+        return set()
+    rows = (
+        client().table("nodes").select("source_url")
+        .in_("source_url", list(urls)).execute().data or []
+    )
+    return {r["source_url"] for r in rows if r.get("source_url")}
 
 
 def superseded_node_ids(ids: Sequence[str]) -> set:

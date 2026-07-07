@@ -124,6 +124,7 @@
     <button data-tab="events">Events</button>
     <button data-tab="entities">Entities</button>
     <button data-tab="topics">Topics</button>
+    <button data-tab="frontier">Frontier</button>
   </nav>
 
   <div id="tab-inferences">
@@ -139,6 +140,7 @@
   <div id="tab-events" class="hidden"></div>
   <div id="tab-entities" class="hidden"></div>
   <div id="tab-topics" class="hidden"></div>
+  <div id="tab-frontier" class="hidden"><div class="loading">Loading…</div></div>
 </div>
 
 <script>
@@ -258,11 +260,47 @@ function renderTopics() {
   $("#tab-topics").innerHTML = `<table><thead><tr><th>Topic</th><th>Aliases</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
+// frontier tab: fetched lazily on first open (it computes read-time maps)
+let frontierLoaded = false;
+async function renderFrontier() {
+  if (frontierLoaded) return;
+  try {
+    const [contested, front] = await Promise.all([
+      fetch("/contested").then((r) => r.json()),
+      fetch("/frontier").then((r) => r.json()),
+    ]);
+    const clusters = (contested || []).map((c) => `
+      <div class="card contested">
+        <div class="card-head"><div class="card-content"><b>${esc(c.topic)}</b> — ${c.contested_count} disputed</div></div>
+        <div class="details open">${c.items.slice(0, 4).map((i) => `
+          <div class="ev">${esc(i.content)}
+            ${(i.defeaters || []).slice(0, 2).map((d) => `<div class="sig">↳ defeated by: ${esc(d.content)}</div>`).join("")}
+          </div>`).join("")}
+        </div>
+      </div>`).join("") || '<div class="empty">Nothing contested.</div>';
+    const gaps = (front.coverage_gaps || []).slice(0, 15).map((r) => `
+      <tr><td>${esc(r.topic)}${r.thin ? ' <span class="tag evidence">thin</span>' : ""}</td>
+      <td>${r.raw_nodes}</td><td>${r.inferences}</td><td>${r.corroborated}</td><td>${r.contested}</td><td>${pct(r.settled_ratio)}</td></tr>`).join("");
+    const links = (front.underived_links || []).map((u) => `
+      <div class="ev">${f2(u.similarity)} · ${esc(u.a.content)}<div class="sig">↔ ${esc(u.b.content)}</div></div>`).join("")
+      || '<div class="ev" style="color:var(--muted)">none — every strong pair has been reasoned about</div>';
+    $("#tab-frontier").innerHTML = `
+      <h3>Disputed (contested clusters)</h3>${clusters}
+      <h3>Unknown (coverage gaps — thinnest first)</h3>
+      <table><thead><tr><th>Topic</th><th>Raw</th><th>Inf</th><th>Corr</th><th>Cont</th><th>Settled</th></tr></thead><tbody>${gaps}</tbody></table>
+      <h3>Un-derived links (open questions)</h3>${links}`;
+    frontierLoaded = true;
+  } catch (e) {
+    $("#tab-frontier").innerHTML = '<div class="empty">Failed to load /frontier — is the server running?</div>';
+  }
+}
+
 // tab switching
 document.querySelectorAll("nav.tabs button").forEach((b) => b.onclick = () => {
   document.querySelectorAll("nav.tabs button").forEach((x) => x.classList.toggle("active", x === b));
-  ["inferences", "events", "entities", "topics"].forEach((t) =>
+  ["inferences", "events", "entities", "topics", "frontier"].forEach((t) =>
     $("#tab-" + t).classList.toggle("hidden", t !== b.dataset.tab));
+  if (b.dataset.tab === "frontier") renderFrontier();
 });
 
 // status filter

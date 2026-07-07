@@ -7,11 +7,15 @@ Endpoints:
   GET  /dashboard/data    aggregate JSON powering the dashboard
   POST /ingest            ingest one piece of text
   POST /ingest/news       ingest a batch from NewsAPI
+  POST /ingest/poll       one incremental domain-stream cycle (Phase 5)
   POST /infer/run         flush the batched inference engine
   GET  /nodes             list nodes (filterable)
   GET  /nodes/{id}/graph  one-hop provenance trace around a node
   GET  /inferences        list inference nodes
   GET  /entities          list entities + aliases
+  GET  /contested         disputed map: contested inferences clustered by topic
+  GET  /frontier          unknown map: coverage gaps + un-derived links
+  GET  /domain/{topic}    one topic's full rollup (raw + derived, by status)
 """
 from __future__ import annotations
 
@@ -25,6 +29,8 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 import db
+import domain_stream
+import frontier
 from ingestion import ingest_from_newsapi, ingest_text, run_inference_batch
 
 # Columns returned to clients — everything except the 1536-dim embedding.
@@ -180,6 +186,46 @@ def ingest_news(body: NewsBody) -> dict:
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     return {"ingested_count": len(node_ids), "node_ids": node_ids}
+
+
+class PollBody(BaseModel):
+    queries: Optional[list[str]] = None
+    page_size: int = 8
+
+
+@app.post("/ingest/poll")
+def ingest_poll(body: PollBody) -> dict:
+    """One incremental domain-stream cycle: fetch -> skip seen -> ingest -> infer/revise."""
+    try:
+        return domain_stream.poll(body.queries, body.page_size)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# --- frontier / completeness map (Phase 4; read-time, never materialized) -----
+@app.get("/contested")
+def contested() -> list[dict]:
+    """The disputed map: contested inferences clustered by topic, with defeaters."""
+    return frontier.contested_clusters()
+
+
+@app.get("/frontier")
+def frontier_map() -> dict:
+    """The unknown map: per-topic coverage gaps + strong un-derived links."""
+    g = frontier._graph()
+    return {
+        "coverage_gaps": frontier.coverage_gaps(g),
+        "underived_links": frontier.underived_links(g),
+    }
+
+
+@app.get("/domain/{topic_name}")
+def domain(topic_name: str) -> dict:
+    """Everything the graph knows under one topic (DAG rollup + derived layer)."""
+    view = frontier.domain_view(topic_name)
+    if view is None:
+        raise HTTPException(status_code=404, detail=f"topic {topic_name!r} not found")
+    return view
 
 
 @app.post("/infer/run")

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -383,10 +384,37 @@ def _link_entities(
         name = (item or {}).get("name")
         if not name:
             continue
+        role = (item or {}).get("role") or "mentioned"
+        # Compound surface forms ("US-Iran", "Japan/Korea") link their PARTS when
+        # every part is already a known entity — a "US-Iran" pseudo-entity poisons
+        # streams and coverage. Unknown-part compounds (e.g. "Coca-Cola") stay intact.
+        part_ids = _compound_entity_ids(name)
+        if part_ids:
+            for pid in part_ids:
+                roles.setdefault(pid, role)
+            continue
         entity_id = _resolve_entity(name, context)
-        roles.setdefault(entity_id, (item or {}).get("role") or "mentioned")
+        roles.setdefault(entity_id, role)
     for entity_id, role in roles.items():
         db.insert_node_entity(node_id, entity_id, role)
+
+
+def _compound_entity_ids(name: str) -> Optional[list[str]]:
+    """Entity ids for the parts of a compound name, or None if it isn't one.
+
+    A name splits only on -, –, or / into 2+ parts, and counts as a compound only
+    when EVERY part already resolves to an existing entity by exact name/alias.
+    """
+    parts = [p.strip() for p in re.split(r"[-–/]", name) if p.strip()]
+    if len(parts) < 2:
+        return None
+    ids: list[str] = []
+    for part in parts:
+        row = db.find_entity(part)
+        if row is None:
+            return None
+        ids.append(row["id"])
+    return ids
 
 
 # Runtime guards: flip false (with one warning) if the live DB schema predates the
