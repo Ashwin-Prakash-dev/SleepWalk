@@ -187,7 +187,11 @@ GRADED_CEILING_SLOPE  = 0.40
 # Only SUSTAINED objections remain defeaters; the deterministic arithmetic still
 # sets status/confidence. ~3 extra LLM calls per debated inference. Fail-safe: any
 # LLM failure keeps all defeaters (baseline behavior).
-DEBATE_VERDICTS = os.environ.get("ENCELADUS_DEBATE", "0") == "1"
+# Default ON since 2026-07-07: measured on the n=70 benchmark vs same-instance
+# baseline as P 0.950->0.955, R 0.452->0.500, ECE 0.191->0.116; freed 8/13 true
+# rows from spurious 'contested', added zero false corroborations. Set =0 to
+# disable the escalation (baseline single-pass classification).
+DEBATE_VERDICTS = os.environ.get("ENCELADUS_DEBATE", "1") == "1"
 #
 # Count coverage by shared ENTITIES instead of exact actor/subject strings —
 # "Sandar's government" vs "Sandar's grid operator" don't string-match, so dense
