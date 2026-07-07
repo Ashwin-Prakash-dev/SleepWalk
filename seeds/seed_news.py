@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) 
 
 import db
 import ingestion
+import newsclean
 import seed_large  # reuse reset()
 import seed_roots
 import sources
@@ -40,23 +41,10 @@ except Exception:
 SNAPSHOT_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "seed_data", "news_snapshot.jsonl"
 )
-# Sources that publish multi-headline digests rather than single-event articles.
-AGGREGATOR_SOURCES = {"Slashdot.org", "Google News", "Yahoo Entertainment"}
-MIN_DESC_CHARS = 30
 
-
-def _clean_description(desc: str) -> str:
-    """Strip syndication boilerplate ('The post … appeared first on …') and cruft."""
-    desc = re.split(r"\n+The post ", desc)[0]               # common WordPress footer
-    desc = re.sub(r"\s*The post .*?appeared first on .*$", "", desc)  # if no newline
-    desc = re.sub(r"\s*\[\+\d+ chars\]\s*$", "", desc)      # NewsAPI truncation marker
-    return desc.strip().rstrip("…").strip()
-
-
-def _valid(row: dict) -> bool:
-    if (row.get("source") or "") in AGGREGATOR_SOURCES:
-        return False
-    return len(_clean_description(row.get("description", ""))) >= MIN_DESC_CHARS
+# Cleaning/filtering lives in the shared root module (also used by domain_stream).
+_clean_description = newsclean.clean_description
+_valid = newsclean.valid_article
 
 
 def _select_balanced(rows: list[dict], limit: int) -> list[dict]:

@@ -681,6 +681,7 @@ def update_inference_verdict(
     alternatives: Any,
     converged_with: Sequence[str],
     revised_at: str,
+    debate: Any = None,
 ) -> None:
     """Overwrite an inference's verdict after re-verification (belief revision)."""
     client().table("inference_meta").update({
@@ -691,6 +692,7 @@ def update_inference_verdict(
         "alternatives": alternatives,
         "converged_with": list(converged_with),
         "revised_at": revised_at,
+        "debate": debate,
     }).eq("node_id", node_id).execute()
     client().table("nodes").update({"confidence": confidence}).eq("id", node_id).execute()
 
@@ -739,6 +741,7 @@ def insert_inference_meta(
     defeater_node_ids: Sequence[str],
     alternatives: Any,
     converged_with: Optional[Sequence[str]] = None,
+    debate: Any = None,
 ) -> dict[str, Any]:
     """Upsert the verification verdict + provenance for an inference node."""
     payload: dict[str, Any] = {
@@ -750,5 +753,6 @@ def insert_inference_meta(
         "defeater_node_ids": list(defeater_node_ids or []),
         "alternatives": alternatives or [],
         "converged_with": list(converged_with or []),
+        "debate": debate,
     }
     return _first(client().table("inference_meta").upsert(payload).execute())

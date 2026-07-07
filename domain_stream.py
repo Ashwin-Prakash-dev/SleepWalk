@@ -26,9 +26,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import db
 import ingestion
+import newsclean
 import sources
 from ingestion import ingest_text, run_inference_batch
-from seeds import seed_news  # cleaning + aggregator filtering (namespace package)
 
 load_dotenv()
 
@@ -83,7 +83,7 @@ def poll(queries: list[str] | None = None, page_size: int = 8) -> dict:
             }
             if not row["title"] or row["title"] == "[Removed]" or not row["url"]:
                 continue
-            if row["url"] in seen_urls or not seed_news._valid(row):
+            if row["url"] in seen_urls or not newsclean.valid_article(row):
                 continue
             seen_urls.add(row["url"])
             candidates.append(row)
@@ -93,7 +93,7 @@ def poll(queries: list[str] | None = None, page_size: int = 8) -> dict:
 
     ingested = 0
     for a in fresh:
-        text = f"{a['title']}. {seed_news._clean_description(a['description'])}"
+        text = f"{a['title']}. {newsclean.clean_description(a['description'])}"
         weight = sources.weight_for(a.get("source")) if ingestion.USE_SOURCE_WEIGHTS else None
         try:
             ingest_text(text, a["url"], event_date=a.get("published_at"), source_weight=weight)

@@ -537,6 +537,132 @@ def classify_evidence(
     return _as_list(result, "classifications", "results", "data")
 
 
+# --- debate escalation tier (opponent -> rebuttal -> mediator) ----------------
+# Structured evidential debate over DEFEATERS, run only when a verdict is
+# borderline (support and defeaters both present). Every turn is grounded in the
+# cited evidence; the mediator only sustains/overrules objections — the
+# deterministic verdict arithmetic still sets status and confidence.
+
+OPPONENT_SYSTEM_PROMPT = (
+    "You are the opposition in a structured evidential debate. For each cited "
+    "evidence item, state the strongest objection it grounds against the proposed "
+    "inference. Objections must rest ONLY on what the cited evidence says — no "
+    "outside knowledge, no speculation. If an item merely shares a topic or actors "
+    "with the inference and grounds no real objection, return null for it. "
+    "Respond with valid JSON only. No preamble, no markdown."
+)
+
+OPPONENT_USER_PROMPT = """PROPOSED INFERENCE:
+"{inference}"
+
+CITED EVIDENCE (0-indexed — each was flagged as possibly contradicting the inference):
+{evidence}
+
+For each evidence item, state the strongest objection it grounds against the inference, or null if it grounds none.
+
+Return a JSON array, one object per item: {{"index": <int>, "objection": <string or null>}}"""
+
+
+REBUTTAL_SYSTEM_PROMPT = (
+    "You argue FOR a proposed inference in a structured evidential debate. For "
+    "each objection, either REBUT it — explaining, from the premises and "
+    "supporting evidence quoted, why it does not defeat the inference — or "
+    "CONCEDE if it genuinely does. Ground every rebuttal in the quoted material "
+    "only. Respond with valid JSON only. No preamble, no markdown."
+)
+
+REBUTTAL_USER_PROMPT = """PROPOSED INFERENCE:
+"{inference}"
+
+ITS PREMISES:
+{premises}
+
+SUPPORTING EVIDENCE (sample):
+{supports}
+
+OBJECTIONS (0-indexed, each with the evidence it cites):
+{objections}
+
+For each objection: rebut it or concede.
+
+Return a JSON array, one object per objection: {{"index": <int>, "concede": <bool>, "response": <string>}}"""
+
+
+MEDIATOR_SYSTEM_PROMPT = (
+    "You are a neutral adjudicator in a structured evidential debate. For each "
+    "objection/rebuttal pair, rule SUSTAINED (the cited evidence genuinely defeats "
+    "or materially undercuts the inference) or OVERRULED (the objection is topical "
+    "tension, a misreading, or was successfully rebutted). Base each ruling ONLY "
+    "on the quoted evidence and arguments. A conceded objection is always "
+    "sustained. Respond with valid JSON only. No preamble, no markdown."
+)
+
+MEDIATOR_USER_PROMPT = """PROPOSED INFERENCE:
+"{inference}"
+
+EXCHANGES (0-indexed):
+{exchanges}
+
+Rule on each exchange.
+
+Return a JSON array, one object per exchange: {{"index": <int>, "ruling": "sustained" | "overruled", "rationale": <one sentence>}}"""
+
+
+def _indexed_block(items: list[str]) -> str:
+    return "\n".join(f"[{i}] {t}" for i, t in enumerate(items)) or "(none)"
+
+
+def debate_object(inference: str, defeater_texts: list[str]) -> list[Optional[str]]:
+    """Opponent turn: strongest objection each defeater grounds (None = no objection)."""
+    prompt = OPPONENT_USER_PROMPT.format(
+        inference=inference, evidence=_indexed_block(defeater_texts)
+    )
+    out: list[Optional[str]] = [None] * len(defeater_texts)
+    result = _complete_json(OPPONENT_SYSTEM_PROMPT, prompt, max_tokens=1024)
+    for r in _as_list(result, "objections", "results", "data"):
+        i = r.get("index")
+        if isinstance(i, int) and 0 <= i < len(out):
+            out[i] = r.get("objection") or None
+    return out
+
+
+def debate_rebut(
+    inference: str, premises: list[str], supports: list[str], objections: list[str]
+) -> list[dict]:
+    """Proposer turn: rebut or concede each objection."""
+    prompt = REBUTTAL_USER_PROMPT.format(
+        inference=inference,
+        premises=_indexed_block(premises),
+        supports=_indexed_block(supports),
+        objections=_indexed_block(objections),
+    )
+    out = [{"concede": False, "response": ""} for _ in objections]
+    result = _complete_json(REBUTTAL_SYSTEM_PROMPT, prompt, max_tokens=1024)
+    for r in _as_list(result, "rebuttals", "results", "data"):
+        i = r.get("index")
+        if isinstance(i, int) and 0 <= i < len(out):
+            out[i] = {"concede": bool(r.get("concede")), "response": str(r.get("response", ""))}
+    return out
+
+
+def debate_adjudicate(inference: str, exchanges: list[str]) -> list[dict]:
+    """Mediator turn: sustain/overrule each objection-rebuttal exchange.
+
+    Defaults to SUSTAINED on missing/failed rulings — the fail-safe direction is
+    the skeptical one (a defeater stays a defeater unless explicitly overruled).
+    """
+    prompt = MEDIATOR_USER_PROMPT.format(
+        inference=inference, exchanges=_indexed_block(exchanges)
+    )
+    out = [{"ruling": "sustained", "rationale": "(no ruling returned)"} for _ in exchanges]
+    result = _complete_json(MEDIATOR_SYSTEM_PROMPT, prompt, max_tokens=1024)
+    for r in _as_list(result, "rulings", "results", "data"):
+        i = r.get("index")
+        if isinstance(i, int) and 0 <= i < len(out) and r.get("ruling") in ("sustained", "overruled"):
+            out[i] = {"ruling": r["ruling"], "rationale": str(r.get("rationale", ""))}
+    return out
+
+
 # --- labeling aid (NOT part of the pipeline) ---------------------------------
 JUDGE_SYSTEM_PROMPT = (
     "You are an independent fact-checking analyst. Judge whether a proposed "

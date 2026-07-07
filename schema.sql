@@ -378,3 +378,9 @@ $$;
 -- arrived evidence (null = never revised since creation). Supersession itself is
 -- an edge ('supersedes', newer -> older) plus the CHECK addition in section 2.
 alter table inference_meta add column if not exists revised_at timestamptz;
+
+-- 12. Debate escalation tier ---------------------------------------------------
+-- Audit trail of the opponent/rebuttal/mediator exchange for defeaters that were
+-- debated (ENCELADUS_DEBATE): [{node_id, objection, concede, rebuttal, ruling,
+-- rationale}]. Null when no debate ran for this inference.
+alter table inference_meta add column if not exists debate jsonb;

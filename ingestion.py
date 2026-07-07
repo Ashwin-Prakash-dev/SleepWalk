@@ -28,6 +28,9 @@ from embeddings import embed
 from llm_service import (
     classify_evidence,
     classify_topic_parent,
+    debate_adjudicate,
+    debate_object,
+    debate_rebut,
     enumerate_alternatives,
     extract_node,
     reason_pair,
@@ -176,6 +179,15 @@ GRADED_MIN_SUPPORTS   = 2     # supports needed to corroborate below the coverag
 GRADED_UNVERIFIED_CAP = 0.70  # measured ~0.78-0.83 true; discounted for label noise
 GRADED_CEILING_FLOOR  = 0.55  # graded coverage ceiling: 0.55 + 0.40*coverage
 GRADED_CEILING_SLOPE  = 0.40
+#
+# Debate escalation tier: when a verdict is BORDERLINE (support and defeaters both
+# present — the measured true-but-contested failure shape), run a structured
+# evidential debate over the defeaters: opponent states each objection from the
+# cited evidence, the proposer rebuts or concedes, a mediator sustains/overrules.
+# Only SUSTAINED objections remain defeaters; the deterministic arithmetic still
+# sets status/confidence. ~3 extra LLM calls per debated inference. Fail-safe: any
+# LLM failure keeps all defeaters (baseline behavior).
+DEBATE_VERDICTS = os.environ.get("ENCELADUS_DEBATE", "0") == "1"
 #
 # Count coverage by shared ENTITIES instead of exact actor/subject strings —
 # "Sandar's government" vs "Sandar's grid operator" don't string-match, so dense
@@ -1039,6 +1051,67 @@ def _should_contest(defeater_ids: list, support_ids: list) -> bool:
     return True  # strict: baseline behaviour
 
 
+def _debate_defeaters(
+    content: str,
+    node_a: dict,
+    node_b: dict,
+    support_ids: list[str],
+    defeater_recs: list[dict],
+    retrieved: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Escalation tier: opponent -> rebuttal -> mediator over borderline defeaters.
+
+    Returns (surviving_defeater_recs, audit). Every turn is grounded in the cited
+    node contents; a defeater survives only if its objection is SUSTAINED (a
+    proposer concession always sustains). Fail-safe: on any LLM failure, ALL
+    defeaters are kept — the debate can only ever make the verdict more lenient
+    than baseline when the mediator explicitly overrules an objection.
+    """
+    content_by_id = {n["id"]: n.get("content", "") for n in retrieved}
+    texts = [content_by_id.get(r["node_id"], "(unknown)") for r in defeater_recs]
+    try:
+        objections = debate_object(content, texts)
+        active = [i for i, o in enumerate(objections) if o]
+        audit: list[dict] = []
+        sustained: list[dict] = []
+
+        if active:
+            premises = [node_a.get("content", ""), node_b.get("content", "")]
+            supports_sample = [content_by_id.get(s, "") for s in support_ids[:3]]
+            obj_texts = [f"{objections[i]}  [cited evidence: {texts[i]}]" for i in active]
+            rebuttals = debate_rebut(content, premises, supports_sample, obj_texts)
+            exchanges = [
+                f"OBJECTION: {objections[i]} | EVIDENCE: {texts[i]} | PROPOSER: "
+                + ("CONCEDES" if rebuttals[k]["concede"] else rebuttals[k]["response"])
+                for k, i in enumerate(active)
+            ]
+            rulings = debate_adjudicate(content, exchanges)
+            for k, i in enumerate(active):
+                ruling = "sustained" if rebuttals[k]["concede"] else rulings[k]["ruling"]
+                audit.append({
+                    "node_id": defeater_recs[i]["node_id"],
+                    "objection": objections[i],
+                    "concede": rebuttals[k]["concede"],
+                    "rebuttal": rebuttals[k]["response"],
+                    "ruling": ruling,
+                    "rationale": rulings[k]["rationale"],
+                })
+                if ruling == "sustained":
+                    sustained.append(defeater_recs[i])
+
+        for i, o in enumerate(objections):
+            if not o:  # the opponent itself found nothing this evidence grounds
+                audit.append({
+                    "node_id": defeater_recs[i]["node_id"],
+                    "objection": None,
+                    "ruling": "overruled",
+                    "rationale": "opponent found no objection grounded in the evidence",
+                })
+        return sustained, audit
+    except Exception as exc:
+        return defeater_recs, [{"error": f"debate failed, defeaters kept: {exc}"}]
+
+
 def _verify_inference(
     inference: dict, node_a: dict, node_b: dict, base_conf: float
 ) -> dict:
@@ -1055,8 +1128,7 @@ def _verify_inference(
     classifications = _classify_evidence(content, alternatives, retrieved)
 
     support_ids: list[str] = []
-    defeater_ids: list[str] = []
-    alt_supported: set[int] = set()
+    defeater_recs: list[dict] = []  # {"node_id", "alt"} — alt = alternative_index
     for c in classifications:
         idx = c.get("index")
         if not isinstance(idx, int) or not (0 <= idx < len(retrieved)):
@@ -1066,19 +1138,28 @@ def _verify_inference(
         if label == "supports_inference":
             support_ids.append(node_id)
         elif label == "supports_alternative":
-            defeater_ids.append(node_id)
             ai = c.get("alternative_index")
-            if isinstance(ai, int):
-                alt_supported.add(ai)
+            defeater_recs.append({"node_id": node_id, "alt": ai if isinstance(ai, int) else None})
 
-    if SUPERSESSION and (support_ids or defeater_ids):
+    if SUPERSESSION and (support_ids or defeater_recs):
         # Overtaken reports are history, not live evidence — they can neither
-        # corroborate nor contest. (Their alternative_index marks are kept, which
-        # only errs conservative: a once-supported alternative stays non-silent.)
-        stale = db.superseded_node_ids(support_ids + defeater_ids)
+        # corroborate nor contest.
+        stale = db.superseded_node_ids(support_ids + [r["node_id"] for r in defeater_recs])
         if stale:
             support_ids = [i for i in support_ids if i not in stale]
-            defeater_ids = [i for i in defeater_ids if i not in stale]
+            defeater_recs = [r for r in defeater_recs if r["node_id"] not in stale]
+
+    # Debate escalation: only borderline verdicts (support AND defeaters present)
+    # get the opponent/rebuttal/mediator treatment; sustained objections remain.
+    debate_audit = None
+    if DEBATE_VERDICTS and support_ids and defeater_recs:
+        defeater_recs, debate_audit = _debate_defeaters(
+            content, node_a, node_b, support_ids, defeater_recs, retrieved
+        )
+
+    defeater_ids = [r["node_id"] for r in defeater_recs]
+    # An alternative counts as evidenced only if a SURVIVING defeater supports it.
+    alt_supported = {r["alt"] for r in defeater_recs if r["alt"] is not None}
 
     coverage = _coverage(node_a, node_b)
 
@@ -1135,6 +1216,7 @@ def _verify_inference(
         "support_ids": support_ids,
         "defeater_ids": defeater_ids,
         "alternatives": alternatives,
+        "debate": debate_audit,
     }
 
 
@@ -1276,6 +1358,7 @@ def _reverify_one(inf_id: str) -> bool:
             alternatives=verdict["alternatives"],
             converged_with=convergent,
             revised_at=datetime.now(timezone.utc).isoformat(),
+            debate=verdict.get("debate"),
         )
     except Exception as exc:  # inference_meta.revised_at missing — degrade loudly, once
         _revision_ok = False
@@ -1333,6 +1416,7 @@ def _persist_inference(
         defeater_node_ids=verdict["defeater_ids"],
         alternatives=verdict["alternatives"],
         converged_with=convergent,
+        debate=verdict.get("debate"),
     )
 
     # Provenance + verification graph.
