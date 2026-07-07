@@ -159,6 +159,31 @@ REVERIFY_MAX_PER_BATCH     = 6     # LLM budget: re-verifications per batch
 # entity with the premises — the unscoped pull floods verification with same-era
 # but unrelated stories (the cross-scenario defeater bleed seen in the diagnostic).
 SCOPED_RETRIEVAL = os.environ.get("ENCELADUS_SCOPED_RETRIEVAL", "1") == "1"
+#
+# --- Graded, calibrated verdicts (measured 2026-07-06, n=81 benchmark) --------
+# The binary coverage>=0.5 cliff was measured as THE recall wall (23 of 27 true-
+# unverified rows failed only that condition), and the fixed caps are measurably
+# under-confident (rows capped at 0.55 were empirically ~78-83% true). Graded mode
+# (a) admits corroboration on strong direct support (>= GRADED_MIN_SUPPORTS) even
+# under thin coverage — confidence stays coverage-ceilinged, so thin corpus still
+# means modest confidence; (b) re-anchors the caps to the measured curve.
+# Default ON since 2026-07-06: measured on the n=81 benchmark as precision 1.000
+# (unchanged), recall 0.278 -> 0.611, ECE 0.151 -> 0.115. Set =0 for the legacy
+# binary-gate baseline.
+GRADED_VERDICT  = os.environ.get("ENCELADUS_GRADED_VERDICT", "1") == "1"
+GRADED_MIN_SUPPORTS   = 2     # supports needed to corroborate below the coverage floor
+GRADED_UNVERIFIED_CAP = 0.70  # measured ~0.78-0.83 true; discounted for label noise
+GRADED_CEILING_FLOOR  = 0.55  # graded coverage ceiling: 0.55 + 0.40*coverage
+GRADED_CEILING_SLOPE  = 0.40
+#
+# Count coverage by shared ENTITIES instead of exact actor/subject strings —
+# "Sandar's government" vs "Sandar's grid operator" don't string-match, so dense
+# scenarios read as thin and the coverage gate starves.
+# MEASURED REGRESSION as-is (2026-07-06): any-shared-entity matching inflates
+# coverage on topically-entangled corpora — precision 1.000 -> 0.943, ECE 0.115 ->
+# 0.155. Stays default-OFF until matching is made discriminative (e.g. require the
+# PRIMARY actor entity, not any mention).
+ENTITY_COVERAGE = os.environ.get("ENCELADUS_ENTITY_COVERAGE", "0") == "1"
 
 # Module-level embedding cache, keyed by node id (content embeddings are stable).
 _emb_cache: dict[str, list[float]] = {}
@@ -879,10 +904,21 @@ def _coverage(node_a: dict, node_b: dict) -> float:
     window = db.nodes_in_time_window(start, end, 200)
     actors = {node_a.get("actor"), node_b.get("actor")} - {None}
     subjects = {node_a.get("subject"), node_b.get("subject")} - {None}
-    related_ids = [
-        n["id"] for n in window
-        if n.get("actor") in actors or n.get("subject") in subjects
-    ]
+    if ENTITY_COVERAGE:
+        # Match on resolved entities (plus the string fallback), so surface-form
+        # variants of one story still count toward density.
+        prem_entities = set(_entity_ids(node_a["id"])) | set(_entity_ids(node_b["id"]))
+        ent_map = db.node_entity_map([n["id"] for n in window])
+        related_ids = [
+            n["id"] for n in window
+            if (ent_map.get(n["id"], set()) & prem_entities)
+            or n.get("actor") in actors or n.get("subject") in subjects
+        ]
+    else:
+        related_ids = [
+            n["id"] for n in window
+            if n.get("actor") in actors or n.get("subject") in subjects
+        ]
     # Weight each related node: by source reliability (when enabled) and down-weight
     # superseded (overtaken) reports so stale density can't manufacture coverage.
     weights = db.source_weights(related_ids) if USE_SOURCE_WEIGHTS else {}
@@ -899,8 +935,12 @@ def _coverage_ceiling(coverage: float) -> float:
 
     Thin coverage (0) caps at 0.40; full coverage (1) allows up to 0.95. This is
     the invariant: 'nothing contradicted it' can never yield high confidence
-    unless the corpus around the claim is actually dense.
+    unless the corpus around the claim is actually dense. Graded mode re-anchors
+    the line to the measured calibration curve (thin-coverage claims were
+    empirically far truer than 0.40 implied).
     """
+    if GRADED_VERDICT:
+        return GRADED_CEILING_FLOOR + GRADED_CEILING_SLOPE * coverage
     return 0.40 + 0.55 * coverage
 
 
@@ -1026,10 +1066,20 @@ def _verify_inference(
     # learned, calibrated model once a labeled set exists (features: support/defeater
     # counts, coverage, reportability, rerank/NLI scores). Keep this branch as the
     # baseline fallback.
+    # Graded mode: strong direct support (>= GRADED_MIN_SUPPORTS) corroborates even
+    # below the coverage floor — the binary floor was measured as the recall wall,
+    # and thin coverage still bounds *confidence* via the coverage ceiling.
+    if GRADED_VERDICT:
+        sufficient_support = bool(support_ids) and (
+            len(support_ids) >= GRADED_MIN_SUPPORTS or coverage >= COVERAGE_CORROBORATION_MIN
+        )
+    else:
+        sufficient_support = bool(support_ids) and coverage >= COVERAGE_CORROBORATION_MIN
+
     if _should_contest(defeater_ids, support_ids):
         status = "contested"
         conf = base_conf * DEFEATER_PENALTY
-    elif support_ids and coverage >= COVERAGE_CORROBORATION_MIN and empty_high:
+    elif sufficient_support and empty_high:
         status = "corroborated"
         mean_rep = sum(empty_high) / len(empty_high)
         bonus_scale = mean_rep
@@ -1041,7 +1091,7 @@ def _verify_inference(
         conf = min(1.0, base_conf + CORROBORATION_BONUS * coverage * bonus_scale)
     else:
         status = "unverified"
-        conf = min(base_conf, UNVERIFIED_CONFIDENCE_CAP)
+        conf = min(base_conf, GRADED_UNVERIFIED_CAP if GRADED_VERDICT else UNVERIFIED_CONFIDENCE_CAP)
 
     # Always apply the coverage gate, regardless of branch.
     conf = min(conf, _coverage_ceiling(coverage))
