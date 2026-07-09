@@ -663,6 +663,48 @@ def debate_adjudicate(inference: str, exchanges: list[str]) -> list[dict]:
     return out
 
 
+# --- Pass 1.5 soundness gate (premises-only logic check) ---------------------
+SOUNDNESS_SYSTEM_PROMPT = (
+    "You are a logic checker. Given exactly two premises and a conclusion drawn "
+    "from them, judge whether the conclusion LOGICALLY FOLLOWS from those premises "
+    "alone. Use NO outside knowledge — reason only from the two premises. Respond "
+    "with valid JSON only. No preamble, no markdown."
+)
+
+SOUNDNESS_USER_PROMPT = """PREMISE A: {a}
+PREMISE B: {b}
+
+CONCLUSION: {c}
+
+Does the conclusion follow from premises A and B alone (no outside knowledge)?
+- Sound: it may combine the premises and add a well-warranted causal or consequential step.
+- UNSOUND if it does any of these:
+  * reverses cause and effect, or asserts a cause that postdates its effect;
+  * asserts a specific date, interval, number, or magnitude the premises do not establish
+    (e.g. treating the dates events were REPORTED as when something BEGAN);
+  * claims a certainty the premises do not support.
+
+Return JSON only: {{"sound": <true|false>, "flaw": <one short sentence, or null if sound>}}"""
+
+
+def check_soundness(premise_a: str, premise_b: str, conclusion: str) -> dict:
+    """Pass 1.5: does the conclusion follow from its two premises alone?
+
+    A premise-only logic check (no world knowledge, so no training-cutoff problem)
+    that catches overreach — effect-dates bounding a start, unwarranted specific
+    values, reversed causation. Biased to Gemini to spare the Groq budget. Returns
+    {"sound": bool, "flaw": str|None}, or {} on failure (caller treats as sound).
+    """
+    prompt = SOUNDNESS_USER_PROMPT.format(a=premise_a, b=premise_b, c=conclusion)
+    try:
+        result = _complete_json(SOUNDNESS_SYSTEM_PROMPT, prompt, max_tokens=150, prefer="gemini")
+    except ValueError:
+        return {}
+    if isinstance(result, dict) and "sound" in result:
+        return {"sound": bool(result["sound"]), "flaw": result.get("flaw")}
+    return {}
+
+
 # --- labeling aid (NOT part of the pipeline) ---------------------------------
 JUDGE_SYSTEM_PROMPT = (
     "You are an independent fact-checking analyst. Judge whether a proposed "

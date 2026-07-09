@@ -122,6 +122,27 @@ emergency imports — over a dense, consistent corpus.
   converging derivations have evidentiary support — which is exactly the
   distinction the fix should encode.
 
+## H — Cael (specific-value overreach)  ← soundness probe
+
+Designed inference: *"Cael's banking crisis began between June 20 and 22"* — an
+interval bound invented from two **effect** reports (a June-20 market plunge, a
+June-22 emergency meeting). Effects only *upper*-bound a start; the premises say
+nothing about when the crisis began. The corpus also contains the real, earlier
+start ("first erupted in late May"), and the supports confirm the crisis EXISTS
+without dating it.
+
+- **Expected status without the soundness gate:** likely `corroborated` (topical
+  supports + no defeater on the *is-it-real* axis) — a **false positive**, the
+  live Iran-war-dating failure reproduced.
+- **With `ENCELADUS_SOUNDNESS_GATE=1`:** the premise-only check should flag the
+  interval as not-following-from-premises and demote to `unverified`.
+- **Expected truth:** `false`.
+- **Diagnoses:** whether a conclusion can be caught as *logically unsound from its
+  own premises*, independent of world knowledge or corpus retrieval. Note the LLM
+  reasoner may instead form a sound inference here (e.g. "Cael faces a banking
+  crisis"); judge whichever inference the run actually produces — the target is any
+  date/interval-overreach card.
+
 ---
 
 ## Expectation matrix (the planted divergences)
@@ -135,6 +156,7 @@ emergency imports — over a dense, consistent corpus.
 | E        | unverified             | unverifiable   | true negative            |
 | F        | unverified (likely)    | true           | **recall** (FN)          |
 | G        | corroborated           | true           | convergence done right   |
+| H        | corroborated w/o gate  | false          | **soundness** (overreach)|
 
 ## Reading the eval output
 

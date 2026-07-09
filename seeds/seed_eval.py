@@ -221,6 +221,27 @@ SCENARIOS: dict[str, list[tuple[str, str, int, str]]] = {
         ("Sandar declared a state of energy emergency on Friday.",
          "Reuters", 6, "support"),
     ],
+
+    # === H — SPECIFIC-VALUE overreach: effect dates can't bound a start =========
+    # Two dated EFFECT reports invite an interval claim ("the crisis began between
+    # June 20 and 22"), but effects only UPPER-bound a start — they say nothing
+    # about when it began. The corpus also states the real, earlier start. Correct
+    # truth: false. Tests the Pass-1.5 soundness gate (premise-only logic) AND the
+    # corpus-grounded defeater path. Watch for any date/interval-overreach inference.
+    "H_cael_date_overreach": [
+        ("Cael's stock market plunged 8 percent on June 20 as its banking crisis deepened.",
+         "Reuters", 18, "premise"),
+        ("Cael's central bank held emergency talks on June 22 to contain the banking turmoil.",
+         "Bloomberg", 20, "premise"),
+        # The refutation already in the corpus — the crisis started weeks earlier:
+        ("Cael's banking crisis, which first erupted in late May, has dragged on for weeks, analysts said.",
+         "Financial Times", 10, "defeater"),
+        # Confirms the crisis EXISTS but says nothing about when it began (topical support):
+        ("Depositors queued outside Cael's largest bank as the banking crisis eroded confidence.",
+         "Reuters", 19, "support"),
+        ("Cael's finance ministry acknowledged the banking sector was under severe stress.",
+         "CNBC", 21, "context"),
+    ],
 }
 
 

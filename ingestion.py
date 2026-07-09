@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 import db
 from embeddings import embed
 from llm_service import (
+    check_soundness,
     classify_evidence,
     classify_topic_parent,
     debate_adjudicate,
@@ -192,6 +193,14 @@ GRADED_CEILING_SLOPE  = 0.40
 # rows from spurious 'contested', added zero false corroborations. Set =0 to
 # disable the escalation (baseline single-pass classification).
 DEBATE_VERDICTS = os.environ.get("ENCELADUS_DEBATE", "1") == "1"
+#
+# Pass 1.5 soundness gate: a premises-only logic check on each freshly-reasoned
+# conclusion, run before the expensive Pass 2. Demotes conclusions that don't
+# follow from their premises (reversed causation, an unpinned date/quantity, an
+# effect-date treated as a start, overclaimed certainty) to 'unverified'. Needs no
+# world knowledge, so it works on post-cutoff events. Targets the specific-value
+# overreach false-positive class (benchmark scenario H). Default off pending measurement.
+SOUNDNESS_GATE = os.environ.get("ENCELADUS_SOUNDNESS_GATE", "0") == "1"
 #
 # Count coverage by shared ENTITIES instead of exact actor/subject strings —
 # "Sandar's government" vs "Sandar's grid operator" don't string-match, so dense
@@ -1124,6 +1133,26 @@ def _verify_inference(
     Returns the verdict dict consumed by _persist_inference.
     """
     content = inference["content"]
+
+    # Pass 1.5 — soundness gate: does the conclusion actually FOLLOW from its two
+    # premises, or overreach (reversed cause/effect, an unpinned date/quantity,
+    # unwarranted certainty)? A premise-only check, before the expensive Pass 2, so
+    # an unsound conclusion is demoted to 'unverified' without paying for retrieval +
+    # classification. Fail-safe: an inconclusive/failed check passes through (baseline).
+    if SOUNDNESS_GATE:
+        sc = check_soundness(node_a.get("content", ""), node_b.get("content", ""), content)
+        if sc and not sc.get("sound", True):
+            return {
+                "status": "unverified",
+                "confidence": min(base_conf, UNVERIFIED_CONFIDENCE_CAP),
+                "coverage": 0.0,
+                "support_ids": [],
+                "defeater_ids": [],
+                "alternatives": [],
+                "debate": None,
+                "unsound": sc.get("flaw"),
+            }
+
     # TODO(out-of-scope): corpus-grounded reportability — estimate each alternative's
     # reportability from how often such events actually surface in the corpus,
     # rather than the LLM's prior. Hooks in here on `alternatives`.

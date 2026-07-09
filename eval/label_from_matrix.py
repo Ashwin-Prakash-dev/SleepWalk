@@ -37,6 +37,7 @@ MATRIX = {
     "anvaria": "true",         # F — warranted & true but sparse (recall probe)
     "coastal": "true",         # F
     "sandar": "true",          # G — true, densely evidenced
+    "cael": "false",           # H — date-interval overreach from effect reports
 }
 
 
