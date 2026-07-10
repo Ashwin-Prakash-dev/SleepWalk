@@ -972,12 +972,20 @@ def _coverage(node_a: dict, node_b: dict) -> float:
             n["id"] for n in window
             if n.get("actor") in actors or n.get("subject") in subjects
         ]
-    # Weight each related node: by source reliability (when enabled) and down-weight
-    # superseded (overtaken) reports so stale density can't manufacture coverage.
-    weights = db.source_weights(related_ids) if USE_SOURCE_WEIGHTS else {}
+    # Coverage measures DENSITY, not reliability — how much corpus surrounds the
+    # claim, so that silence about an alternative is informative. Only superseded
+    # (overtaken) reports are down-weighted, since stale density shouldn't count.
+    #
+    # Source reliability is deliberately NOT folded in here: it is a separate axis,
+    # already applied to the corroboration bonus in _verify_inference. Weighting
+    # coverage by it double-counted reliability and, because DEFAULT_WEIGHT (0.6)
+    # applies to any outlet outside the small curated map, deflated coverage ~40% on
+    # real news (measured: 88/100 nodes at 0.6, max coverage 0.300). Every ceiling
+    # then sat below the 0.70 promotion bar, making derivation depth structurally
+    # impossible. See [[project-north-star]].
     stale = db.superseded_node_ids(related_ids) if SUPERSESSION else set()
     related = sum(
-        weights.get(i, 1.0) * (SUPERSEDED_COVERAGE_WEIGHT if i in stale else 1.0)
+        SUPERSEDED_COVERAGE_WEIGHT if i in stale else 1.0
         for i in related_ids
     )
     return min(1.0, related / COVERAGE_SATURATION)
