@@ -676,13 +676,20 @@ PREMISE B: {b}
 
 CONCLUSION: {c}
 
-Does the conclusion follow from premises A and B alone (no outside knowledge)?
-- Sound: it may combine the premises and add a well-warranted causal or consequential step.
-- UNSOUND if it does any of these:
-  * reverses cause and effect, or asserts a cause that postdates its effect;
-  * asserts a specific date, interval, number, or magnitude the premises do not establish
-    (e.g. treating the dates events were REPORTED as when something BEGAN);
-  * claims a certainty the premises do not support.
+Judge whether the conclusion is a REASONABLE reading of premises A and B (no outside knowledge).
+
+Be permissive about inference: a PLAUSIBLE causal or consequential link — where the cause
+plausibly explains the effect and does not come after it — is SOUND. Do NOT demand deductive
+certainty; proposing a likely cause or downstream consequence is exactly what's wanted.
+
+Mark UNSOUND ONLY if the conclusion commits one of these specific errors:
+  * TEMPORAL/CAUSAL IMPOSSIBILITY — it makes a cause postdate its effect, or treats the dates
+    events were REPORTED as when something BEGAN (effects only upper-bound a start);
+  * INVENTED SPECIFIC VALUE — it asserts a specific date, interval, number, or magnitude that
+    appears in neither premise;
+  * OVERCLAIMED CERTAINTY — it states as certain ("must have", "proves", "definitely") something
+    the premises make merely possible.
+When in doubt, judge it sound.
 
 Return JSON only: {{"sound": <true|false>, "flaw": <one short sentence, or null if sound>}}"""
 

@@ -37,7 +37,9 @@ MATRIX = {
     "anvaria": "true",         # F — warranted & true but sparse (recall probe)
     "coastal": "true",         # F
     "sandar": "true",          # G — true, densely evidenced
-    "cael": "false",           # H — date-interval overreach from effect reports
+    # H (cael) intentionally UNLABELED: the reasoner did not reproduce the designed
+    # date-interval trap (it read the earlier-start node and reasoned soundly), so a
+    # blanket label would be wrong. Label H per-inference by hand if a trap forms.
 }
 
 
