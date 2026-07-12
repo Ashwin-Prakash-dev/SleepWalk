@@ -712,6 +712,116 @@ def check_soundness(premise_a: str, premise_b: str, conclusion: str) -> dict:
     return {}
 
 
+# --- Analysis of Competing Hypotheses (query-time; see ach.py) ----------------
+HYPOTHESES_SYSTEM_PROMPT = (
+    "You are an analyst applying Analysis of Competing Hypotheses. Given a question, "
+    "enumerate a small set of MUTUALLY EXCLUSIVE, jointly near-exhaustive candidate "
+    "answers. Include the obvious readings AND at least one non-obvious or contrarian "
+    "one, so the true answer is unlikely to be omitted (an omitted true hypothesis is "
+    "ACH's fatal flaw). Always respond with valid JSON only. No preamble, no markdown."
+)
+
+HYPOTHESES_USER_PROMPT = """QUESTION: {question}
+{seed_block}
+List up to {max_n} competing hypotheses (candidate answers). Each must be a short, specific,
+mutually-exclusive claim that could be true or false. Include any analyst hypotheses listed
+above, then add the strongest others — including at least one non-obvious possibility.
+
+Return a JSON array of strings."""
+
+
+ACH_CLASSIFY_SYSTEM_PROMPT = (
+    "You are scoring one piece of evidence against competing hypotheses in an ACH "
+    "matrix. For each hypothesis, judge how the evidence bears on it: 'consistent' "
+    "(expected if the hypothesis were true), 'inconsistent' (NOT expected / it "
+    "conflicts with the hypothesis), or 'not_applicable' (neither). Judge only from "
+    "the evidence text, no outside knowledge. Diagnostic evidence is inconsistent "
+    "with some hypotheses and not others — do not lazily mark everything consistent. "
+    "Always respond with valid JSON only. No preamble, no markdown."
+)
+
+ACH_CLASSIFY_USER_PROMPT = """EVIDENCE: {evidence}
+
+HYPOTHESES (0-indexed):
+{hypotheses}
+
+Classify the evidence against EACH hypothesis.
+Return a JSON array, one object per hypothesis:
+{{"index": <int>, "stance": "consistent" | "inconsistent" | "not_applicable"}}"""
+
+
+DISCRIMINATE_SYSTEM_PROMPT = (
+    "You identify the single most diagnostic MISSING piece of evidence in an analysis "
+    "of competing hypotheses — an observation that, if sought, would best distinguish "
+    "which hypothesis is correct. Always respond with valid JSON only. No preamble."
+)
+
+DISCRIMINATE_USER_PROMPT = """QUESTION: {question}
+
+The two leading (least-disconfirmed) hypotheses are:
+H1: {h1}
+H2: {h2}
+
+What single observation or piece of evidence, if found, would most cleanly distinguish
+which of H1 and H2 is correct?
+
+Return JSON only:
+{{"evidence_to_seek": <one sentence: what to look for>,
+  "would_favor_h1": <what finding points to H1>,
+  "would_favor_h2": <what finding points to H2>}}"""
+
+
+def generate_hypotheses(question: str, seeds: list[str], max_n: int = 5) -> list[str]:
+    """Enumerate competing hypotheses for a question (analyst seeds included + expanded)."""
+    seed_block = ""
+    if seeds:
+        seed_block = "Analyst-provided hypotheses to include and build on:\n" + \
+            "\n".join(f"- {s}" for s in seeds) + "\n"
+    prompt = HYPOTHESES_USER_PROMPT.format(question=question, seed_block=seed_block, max_n=max_n)
+    try:
+        result = _complete_json(HYPOTHESES_SYSTEM_PROMPT, prompt, max_tokens=512, prefer="gemini")
+    except ValueError:
+        return list(seeds)
+    hyps = [h for h in _as_list(result, "hypotheses", "results", "data") if isinstance(h, str) and h.strip()]
+    # Keep analyst seeds even if the model dropped them; de-dupe, cap.
+    out: list[str] = []
+    for h in list(seeds) + hyps:
+        if h.strip() and h.strip() not in out:
+            out.append(h.strip())
+    return out[:max_n]
+
+
+def classify_against_hypotheses(evidence: str, hypotheses: list[str]) -> list[str]:
+    """One evidence item's ACH row: stance per hypothesis (aligned to `hypotheses`).
+
+    Returns a list the same length as `hypotheses`, each 'consistent' /
+    'inconsistent' / 'not_applicable' (default on a missing/failed cell).
+    """
+    listing = "\n".join(f"[{i}] {h}" for i, h in enumerate(hypotheses))
+    prompt = ACH_CLASSIFY_USER_PROMPT.format(evidence=evidence, hypotheses=listing)
+    out = ["not_applicable"] * len(hypotheses)
+    try:
+        result = _complete_json(ACH_CLASSIFY_SYSTEM_PROMPT, prompt, max_tokens=512, prefer="gemini")
+    except ValueError:
+        return out
+    for r in _as_list(result, "classifications", "results", "data"):
+        i = r.get("index")
+        stance = r.get("stance")
+        if isinstance(i, int) and 0 <= i < len(out) and stance in ("consistent", "inconsistent", "not_applicable"):
+            out[i] = stance
+    return out
+
+
+def discriminating_evidence(question: str, h1: str, h2: str) -> dict:
+    """The most diagnostic missing observation distinguishing the two leading hypotheses."""
+    prompt = DISCRIMINATE_USER_PROMPT.format(question=question, h1=h1, h2=h2)
+    try:
+        result = _complete_json(DISCRIMINATE_SYSTEM_PROMPT, prompt, max_tokens=300, prefer="gemini")
+    except ValueError:
+        return {}
+    return result if isinstance(result, dict) else {}
+
+
 # --- labeling aid (NOT part of the pipeline) ---------------------------------
 JUDGE_SYSTEM_PROMPT = (
     "You are an independent fact-checking analyst. Judge whether a proposed "

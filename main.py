@@ -16,6 +16,7 @@ Endpoints:
   GET  /contested         disputed map: contested inferences clustered by topic
   GET  /frontier          unknown map: coverage gaps + un-derived links
   GET  /domain/{topic}    one topic's full rollup (raw + derived, by status)
+  POST /ask               Analysis of Competing Hypotheses over the graph (decision support)
 """
 from __future__ import annotations
 
@@ -28,6 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
+import ach
 import db
 import domain_stream
 import frontier
@@ -226,6 +228,21 @@ def domain(topic_name: str) -> dict:
     if view is None:
         raise HTTPException(status_code=404, detail=f"topic {topic_name!r} not found")
     return view
+
+
+class AskBody(BaseModel):
+    question: str
+    hypotheses: Optional[list[str]] = None
+    max_hypotheses: int = 5
+
+
+@app.post("/ask")
+def ask(body: AskBody) -> dict:
+    """Analysis of Competing Hypotheses over the graph — decision support, not a verdict."""
+    try:
+        return ach.ask(body.question, body.hypotheses, body.max_hypotheses)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/infer/run")
