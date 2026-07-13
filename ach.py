@@ -78,8 +78,13 @@ def ask(question: str, seeds: Optional[list[str]] = None, max_hypotheses: int = 
         matrix.append({"id": e["id"], "content": e["content"], "weight": round(w, 2),
                        "diagnostic": diagnostic, "stances": stances})
 
-    # Least-disconfirmed first; ties broken by more consistent support.
-    ranked = sorted(scores, key=lambda s: (s["disconfirmation"], -s["consistent"]))
+    # Rank ENGAGED hypotheses first (some evidence bears on them), then least-
+    # disconfirmed, then most support. A hypothesis no evidence touches is UNASSESSED,
+    # not surviving — without this guard a vague, unfalsifiable hypothesis wins by
+    # attracting zero inconsistencies (the classic least-disconfirmed pitfall).
+    for s in scores:
+        s["assessed"] = (s["disconfirmation"] + s["consistent"]) > 0
+    ranked = sorted(scores, key=lambda s: (not s["assessed"], s["disconfirmation"], -s["consistent"]))
     for s in ranked:
         s["disconfirmation"] = round(s["disconfirmation"], 2)
         s["consistent"] = round(s["consistent"], 2)
@@ -106,8 +111,8 @@ def _print(result: dict) -> None:
         print("  " + result["error"]); return
     print(f"\nHYPOTHESES (least-disconfirmed first, over {result['evidence_count']} evidence items):")
     for i, s in enumerate(result["hypotheses_ranked"]):
-        lead = "  <- leading" if i == 0 else ""
-        print(f"  [{i}] disconfirm={s['disconfirmation']:<5} support={s['consistent']:<5} {s['hypothesis']}{lead}")
+        tag = "  <- leading" if i == 0 and s.get("assessed") else ("  (unassessed)" if not s.get("assessed") else "")
+        print(f"  [{i}] disconfirm={s['disconfirmation']:<5} support={s['consistent']:<5} {s['hypothesis']}{tag}")
         for ev in s["inconsistent_evidence"][:2]:
             print(f"        x {ev[:82]}")
     gap = result.get("evidence_gap") or {}
