@@ -202,6 +202,12 @@ DEBATE_VERDICTS = os.environ.get("ENCELADUS_DEBATE", "1") == "1"
 # overreach false-positive class (benchmark scenario H). Default off pending measurement.
 SOUNDNESS_GATE = os.environ.get("ENCELADUS_SOUNDNESS_GATE", "0") == "1"
 #
+# ACH v2 — standing questions: after each batch, route the new raw evidence to any
+# open questions it bears on (hypothesis-similarity), re-score their matrices, and
+# log leader changes (flip alerts). No-op when no questions are open; degrades to a
+# warning if the questions schema hasn't been applied. Budgets live in ach.py.
+STANDING_QUESTIONS = os.environ.get("ENCELADUS_STANDING_QUESTIONS", "1") == "1"
+#
 # Count coverage by shared ENTITIES instead of exact actor/subject strings —
 # "Sandar's government" vs "Sandar's grid operator" don't string-match, so dense
 # scenarios read as thin and the coverage gate starves.
@@ -652,12 +658,20 @@ def run_inference_batch(force: bool = False) -> dict:
     # re-open and re-verify the most affected ones (budgeted).
     revised = _reverify_affected(new_nodes, exclude_ids=all_created) if BELIEF_REVISION else 0
 
+    # ACH v2 — standing questions: same evidence may bear on open questions.
+    questions = {"updated": 0, "flips": 0}
+    if STANDING_QUESTIONS:
+        import ach  # lazy: keeps the engine importable without the ACH layer
+        questions = ach.update_affected_questions(new_nodes)
+
     db.mark_nodes_processed(raw_ids)
     return {
         "pairs": total_pairs,
         "inferences": total_created,
         "deduped": deduped,
         "revised": revised,
+        "questions_updated": questions.get("updated", 0),
+        "question_flips": questions.get("flips", 0),
         "processed": len(raw_ids),
         "passes": passes,
     }

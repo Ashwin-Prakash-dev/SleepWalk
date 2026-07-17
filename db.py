@@ -732,6 +732,115 @@ def match_inferences(
     return resp.data or []
 
 
+# --- standing questions (ACH v2) ----------------------------------------------
+def insert_question(question: str, embedding: Embedding) -> dict[str, Any]:
+    return _first(client().table("questions").insert(
+        {"question": question, "embedding": list(embedding)}
+    ).execute())
+
+
+def insert_hypothesis(question_id: str, content: str, embedding: Embedding) -> dict[str, Any]:
+    return _first(client().table("hypotheses").insert(
+        {"question_id": question_id, "content": content, "embedding": list(embedding)}
+    ).execute())
+
+
+def list_questions(status: Optional[str] = None) -> list[dict[str, Any]]:
+    q = client().table("questions").select(
+        "id,question,status,leading_hypothesis_id,evidence_gap,created_at,updated_at"
+    )
+    if status:
+        q = q.eq("status", status)
+    return q.order("created_at", desc=True).execute().data or []
+
+
+def get_question(question_id: str) -> Optional[dict[str, Any]]:
+    rows = (
+        client().table("questions")
+        .select("id,question,status,leading_hypothesis_id,evidence_gap,created_at,updated_at")
+        .eq("id", question_id).limit(1).execute().data
+    )
+    return rows[0] if rows else None
+
+
+def question_hypotheses(question_id: str) -> list[dict[str, Any]]:
+    """Hypotheses of a question in a STABLE order (creation order)."""
+    return (
+        client().table("hypotheses")
+        .select("id,content,disconfirmation,support,assessed,rank,created_at")
+        .eq("question_id", question_id).order("created_at").execute().data or []
+    )
+
+
+def upsert_hypothesis_evidence(hypothesis_id: str, node_id: str, stance: str, weight: float) -> None:
+    client().table("hypothesis_evidence").upsert({
+        "hypothesis_id": hypothesis_id, "node_id": node_id,
+        "stance": stance, "weight": weight,
+    }).execute()
+
+
+def hypothesis_evidence_rows(hypothesis_ids: Sequence[str]) -> list[dict[str, Any]]:
+    if not hypothesis_ids:
+        return []
+    return (
+        client().table("hypothesis_evidence")
+        .select("hypothesis_id,node_id,stance,weight")
+        .in_("hypothesis_id", list(hypothesis_ids)).execute().data or []
+    )
+
+
+def question_evidence_ids(question_id: str) -> set:
+    """Node ids already scored in this question's matrix."""
+    hyp_ids = [h["id"] for h in question_hypotheses(question_id)]
+    return {r["node_id"] for r in hypothesis_evidence_rows(hyp_ids)}
+
+
+def update_hypothesis_score(
+    hypothesis_id: str, *, disconfirmation: float, support: float, assessed: bool, rank: int
+) -> None:
+    client().table("hypotheses").update({
+        "disconfirmation": disconfirmation, "support": support,
+        "assessed": assessed, "rank": rank,
+    }).eq("id", hypothesis_id).execute()
+
+
+def update_question_state(
+    question_id: str, *, leading_hypothesis_id: Optional[str],
+    evidence_gap: Any, updated_at: str,
+) -> None:
+    client().table("questions").update({
+        "leading_hypothesis_id": leading_hypothesis_id,
+        "evidence_gap": evidence_gap,
+        "updated_at": updated_at,
+    }).eq("id", question_id).execute()
+
+
+def insert_question_event(question_id: str, event_type: str, detail: Any = None) -> None:
+    client().table("question_events").insert({
+        "question_id": question_id, "event_type": event_type, "detail": detail,
+    }).execute()
+
+
+def question_events(question_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    return (
+        client().table("question_events").select("event_type,detail,created_at")
+        .eq("question_id", question_id).order("created_at", desc=True)
+        .limit(limit).execute().data or []
+    )
+
+
+def match_hypotheses(
+    query_embedding: Embedding, match_threshold: float = 0.45, match_count: int = 10
+) -> list[dict[str, Any]]:
+    """Hypotheses of OPEN questions near an embedding (routes evidence to questions)."""
+    resp = client().rpc("match_hypotheses", {
+        "query_embedding": list(query_embedding),
+        "match_threshold": match_threshold,
+        "match_count": match_count,
+    }).execute()
+    return resp.data or []
+
+
 def insert_inference_meta(
     node_id: str,
     status: str,

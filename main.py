@@ -17,6 +17,9 @@ Endpoints:
   GET  /frontier          unknown map: coverage gaps + un-derived links
   GET  /domain/{topic}    one topic's full rollup (raw + derived, by status)
   POST /ask               Analysis of Competing Hypotheses over the graph (decision support)
+  POST /questions         open a STANDING question (persisted, auto-updated, flip alerts)
+  GET  /questions         list standing questions
+  GET  /questions/{id}    one standing question's ranked hypotheses + gap + events
 """
 from __future__ import annotations
 
@@ -243,6 +246,30 @@ def ask(body: AskBody) -> dict:
         return ach.ask(body.question, body.hypotheses, body.max_hypotheses)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# --- standing questions (ACH v2) -----------------------------------------------
+@app.post("/questions")
+def open_question(body: AskBody) -> dict:
+    """Open a STANDING question: persisted, auto-updated each ingest batch, with
+    leader_changed (flip) events as evidence accumulates."""
+    try:
+        return ach.open_question(body.question, body.hypotheses, body.max_hypotheses)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/questions")
+def list_questions() -> list[dict]:
+    return db.list_questions()
+
+
+@app.get("/questions/{question_id}")
+def question(question_id: str) -> dict:
+    view = ach.question_view(question_id)
+    if view is None:
+        raise HTTPException(status_code=404, detail="question not found")
+    return view
 
 
 @app.post("/infer/run")

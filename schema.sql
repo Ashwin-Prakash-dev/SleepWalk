@@ -384,3 +384,78 @@ alter table inference_meta add column if not exists revised_at timestamptz;
 -- debated (ENCELADUS_DEBATE): [{node_id, objection, concede, rebuttal, ruling,
 -- rationale}]. Null when no debate ran for this inference.
 alter table inference_meta add column if not exists debate jsonb;
+
+-- 13. Standing questions (ACH v2) ---------------------------------------------
+-- Persistent Analysis-of-Competing-Hypotheses: a question owns mutually-exclusive
+-- hypotheses; each hypothesis accumulates an evidence matrix (hypothesis_evidence
+-- cells) as the stream arrives; ranks are recomputed per batch and leader changes
+-- are logged to question_events (the "flip alert"). Decision support only.
+create table if not exists questions (
+  id                     uuid primary key default gen_random_uuid(),
+  question               text not null,
+  status                 text not null default 'open' check (status in ('open', 'closed')),
+  leading_hypothesis_id  uuid,            -- FK added below (hypotheses defined next)
+  evidence_gap           jsonb,           -- {evidence_to_seek, would_favor_h1, would_favor_h2}
+  embedding              vector(1536),
+  created_at             timestamptz default now(),
+  updated_at             timestamptz
+);
+
+create table if not exists hypotheses (
+  id              uuid primary key default gen_random_uuid(),
+  question_id     uuid not null references questions(id) on delete cascade,
+  content         text not null,
+  embedding       vector(1536),
+  disconfirmation float default 0,   -- sum of weights of inconsistent evidence
+  support         float default 0,   -- sum of weights of consistent evidence
+  assessed        boolean default false,
+  rank            int,               -- 0 = leading (engaged-first, least-disconfirmed)
+  created_at      timestamptz default now()
+);
+
+alter table questions drop constraint if exists questions_leading_fk;
+alter table questions add constraint questions_leading_fk
+  foreign key (leading_hypothesis_id) references hypotheses(id) on delete set null;
+
+-- One cell of the evidence x hypothesis matrix.
+create table if not exists hypothesis_evidence (
+  hypothesis_id uuid references hypotheses(id) on delete cascade,
+  node_id       uuid references nodes(id) on delete cascade,
+  stance        text not null check (stance in ('consistent', 'inconsistent', 'not_applicable')),
+  weight        float default 1.0,
+  created_at    timestamptz default now(),
+  primary key (hypothesis_id, node_id)
+);
+
+-- Audit / alert log: 'leader_changed' rows are the flip alerts.
+create table if not exists question_events (
+  id          uuid primary key default gen_random_uuid(),
+  question_id uuid references questions(id) on delete cascade,
+  event_type  text not null check (event_type in ('created', 'evidence_added', 'leader_changed')),
+  detail      jsonb,
+  created_at  timestamptz default now()
+);
+
+create index if not exists hypotheses_question_idx on hypotheses (question_id);
+create index if not exists hypothesis_evidence_node_idx on hypothesis_evidence (node_id);
+create index if not exists question_events_question_idx on question_events (question_id);
+create index if not exists hypotheses_embedding_idx
+  on hypotheses using ivfflat (embedding vector_cosine_ops) with (lists = 100);
+
+-- Route new evidence to affected OPEN questions via hypothesis similarity.
+create or replace function match_hypotheses(
+  query_embedding vector(1536),
+  match_threshold float default 0.45,
+  match_count int default 10
+)
+returns table (id uuid, question_id uuid, content text, similarity float)
+language sql stable as $$
+  select h.id, h.question_id, h.content,
+    1 - (h.embedding <=> query_embedding) as similarity
+  from hypotheses h
+  join questions q on q.id = h.question_id and q.status = 'open'
+  where h.embedding is not null
+    and 1 - (h.embedding <=> query_embedding) > match_threshold
+  order by h.embedding <=> query_embedding
+  limit match_count;
+$$;
